@@ -1,0 +1,3 @@
+set interface state dpdk0 up
+{{INTERFACE_ADDRESS_COMMANDS}}
+ip route add 0.0.0.0/0 via {{DEFAULT_GATEWAY}}

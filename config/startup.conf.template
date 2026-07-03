@@ -1,0 +1,51 @@
+unix {
+  nodaemon
+  log /dev/stderr
+  cli-listen /run/vpp/cli.sock
+  startup-config /run/vpp/config/cli-commands.conf
+}
+
+socksvr { default }
+
+cpu {
+{{CPU_CONFIG}}
+}
+
+buffers {
+  buffers-per-numa 262144
+  default data-size 2048
+  page-size default-hugepage
+}
+
+session {
+  enable
+  use-app-socket-api
+
+  evt_qs_memfd_seg
+  event-queue-length 65536
+  wrk-mq-length 65536
+  wrk-mqs-segment-size 256M
+  preallocated-sessions 131072
+
+  v4-session-table-buckets 262144
+  v4-session-table-memory 1G
+  local-endpoints-table-buckets 131072
+  local-endpoints-table-memory 512M
+}
+
+quic {
+  conn-timeout 300000
+  fifo-size 16M
+}
+
+dpdk {
+  socket-mem 0,0,2048,0
+
+  dev {{PCI_ADDRESS}} {
+    name dpdk0
+    num-rx-queues 1
+    num-tx-queues 1
+    num-rx-desc 4096
+    num-tx-desc 4096
+  }
+}

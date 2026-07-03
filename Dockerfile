@@ -61,10 +61,14 @@ COPY --from=builder /tmp/libmemif-root/usr/local /usr/local
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
+        python3 \
         supervisor \
         vim \
         /tmp/vpp-debs/*.deb \
     && ldconfig \
     && rm -rf /tmp/vpp-debs /var/lib/apt/lists/*
 
-CMD ["/bin/bash"]
+COPY config /usr/share/vpp/templates
+COPY scripts/vpp-entrypoint.py /usr/local/bin/vpp-entrypoint
+
+ENTRYPOINT ["/usr/local/bin/vpp-entrypoint"]

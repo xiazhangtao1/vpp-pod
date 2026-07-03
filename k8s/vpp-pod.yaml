@@ -1,0 +1,152 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vpp-config
+data:
+  VPP_INTERFACE_ADDRESSES: 10.2.0.222-10.2.0.223/20
+  VPP_DEFAULT_GATEWAY: 10.2.7.254
+  startup.conf.template: |
+    unix {
+      nodaemon
+      log /dev/stderr
+      cli-listen /run/vpp/cli.sock
+      startup-config /run/vpp/config/cli-commands.conf
+    }
+    socksvr { default }
+    cpu {
+    {{CPU_CONFIG}}
+    }
+    buffers {
+      buffers-per-numa 262144
+      default data-size 2048
+      page-size default-hugepage
+    }
+    session {
+      enable
+      use-app-socket-api
+      evt_qs_memfd_seg
+      event-queue-length 65536
+      wrk-mq-length 65536
+      wrk-mqs-segment-size 256M
+      preallocated-sessions 131072
+      v4-session-table-buckets 262144
+      v4-session-table-memory 1G
+      local-endpoints-table-buckets 131072
+      local-endpoints-table-memory 512M
+    }
+    quic {
+      conn-timeout 300000
+      fifo-size 16M
+    }
+    dpdk {
+      socket-mem 0,0,2048,0
+      dev {{PCI_ADDRESS}} {
+        name dpdk0
+        num-rx-queues 1
+        num-tx-queues 1
+        num-rx-desc 4096
+        num-tx-desc 4096
+      }
+    }
+  vcl.conf.template: |
+    vcl {
+      app-socket-api /var/run/vpp/app_ns_sockets/default
+      app-scope-global
+      namespace-id default
+      namespace-secret 0
+      heapsize 1073741824
+      max-workers 8
+      segment-size 2147483648
+      add-segment-size 1073741824
+      preallocated-fifo-pairs 64
+      rx-fifo-size 16777216
+      tx-fifo-size 16777216
+      event-queue-size 65536
+    }
+  cli-commands.conf.template: |
+    set interface state dpdk0 up
+    {{INTERFACE_ADDRESS_COMMANDS}}
+    ip route add 0.0.0.0/0 via {{DEFAULT_GATEWAY}}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vpp
+  labels:
+    app: vpp
+spec:
+  restartPolicy: Always
+  containers:
+    - name: vpp
+      image: vpp:26.06
+      imagePullPolicy: IfNotPresent
+      securityContext:
+        privileged: true
+      env:
+        - name: VPP_INTERFACE_ADDRESSES
+          valueFrom:
+            configMapKeyRef:
+              name: vpp-config
+              key: VPP_INTERFACE_ADDRESSES
+        - name: VPP_DEFAULT_GATEWAY
+          valueFrom:
+            configMapKeyRef:
+              name: vpp-config
+              key: VPP_DEFAULT_GATEWAY
+        - name: VPP_CPU_LIMIT
+          valueFrom:
+            resourceFieldRef:
+              containerName: vpp
+              resource: limits.cpu
+              divisor: "1"
+        - name: VPP_TEMPLATE_DIR
+          value: /etc/vpp/templates
+        - name: VCL_CONFIG
+          value: /run/vpp/config/vcl.conf
+      resources:
+        requests:
+          cpu: "2"
+          memory: 4Gi
+          hugepages-1Gi: 2Gi
+          intel.com/external_network: "1"
+        limits:
+          cpu: "2"
+          memory: 4Gi
+          hugepages-1Gi: 2Gi
+          intel.com/external_network: "1"
+      readinessProbe:
+        exec:
+          command:
+            - vppctl
+            - -s
+            - /run/vpp/cli.sock
+            - show
+            - version
+        initialDelaySeconds: 2
+        periodSeconds: 5
+        timeoutSeconds: 3
+        failureThreshold: 3
+      volumeMounts:
+        - name: templates
+          mountPath: /etc/vpp/templates
+          readOnly: true
+        - name: run
+          mountPath: /run/vpp
+        - name: hugepages
+          mountPath: /dev/hugepages
+  volumes:
+    - name: templates
+      configMap:
+        name: vpp-config
+        items:
+          - key: startup.conf.template
+            path: startup.conf.template
+          - key: vcl.conf.template
+            path: vcl.conf.template
+          - key: cli-commands.conf.template
+            path: cli-commands.conf.template
+    - name: run
+      emptyDir: {}
+    - name: hugepages
+      emptyDir:
+        medium: HugePages

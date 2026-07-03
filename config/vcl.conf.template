@@ -1,0 +1,18 @@
+vcl {
+  app-socket-api /var/run/vpp/app_ns_sockets/default
+  app-scope-global
+
+  namespace-id default
+  namespace-secret 0
+
+  heapsize 1073741824
+  max-workers 8
+
+  segment-size 2147483648
+  add-segment-size 1073741824
+
+  preallocated-fifo-pairs 64
+  rx-fifo-size 16777216
+  tx-fifo-size 16777216
+  event-queue-size 65536
+}
