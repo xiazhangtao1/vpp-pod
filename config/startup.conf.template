@@ -39,7 +39,7 @@ quic {
 }
 
 dpdk {
-  socket-mem 0,0,2048,0
+  socket-mem 0,2048
 
   dev {{PCI_ADDRESS}} {
     name dpdk0

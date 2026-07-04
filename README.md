@@ -12,7 +12,7 @@ sudo docker build --network host -t vpp:26.06 .
 ## 部署
 
 1. 编辑 `k8s/vpp-pod.yaml` 中 ConfigMap 的地址和默认网关。
-2. 确认节点提供 `intel.com/external_network`、1 GiB hugepages，并且镜像可用。
+2. 确认节点提供 `intel.com/external_network`、至少 4 GiB 的 1 GiB hugepages，并且镜像可用。
 3. CPU request 与 limit 必须相等且为正整数。
 
 ```bash
