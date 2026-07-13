@@ -1,0 +1,1024 @@
+#!/usr/bin/env python3
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright(c) 2025 Cisco Systems, Inc.
+import unittest
+from asfframework import VppTestRunner
+from framework import VppTestCase
+from config import config
+from vpp_papi import VppEnum
+
+from scapy.packet import Raw
+from scapy.layers.l2 import Ether
+from scapy.layers.inet import IP, UDP, TCP, ICMP
+from scapy.layers.inet6 import IPv6
+
+
+class BaseSfdpTest(VppTestCase):
+    def create_tcp_packet(
+        self,
+        src_mac,
+        dst_mac,
+        src_ip,
+        dst_ip,
+        sport,
+        dport,
+        flags="S",
+        ttl=64,
+        seq=0,
+        ack=0,
+        payload=b"\xa5" * 100,
+    ):
+        return (
+            Ether(src=src_mac, dst=dst_mac)
+            / IP(src=src_ip, dst=dst_ip, ttl=ttl)
+            / TCP(sport=sport, dport=dport, flags=flags, seq=seq, ack=ack)
+            / Raw(payload)
+        )
+
+    def create_udp_packet(self, src_mac, dst_mac, src_ip, dst_ip, sport, dport, ttl=64):
+        return (
+            Ether(src=src_mac, dst=dst_mac)
+            / IP(src=src_ip, dst=dst_ip, ttl=ttl)
+            / UDP(sport=sport, dport=dport)
+            / Raw(b"\xa5" * 100)
+        )
+
+    def create_tcp6_packet(
+        self,
+        src_mac,
+        dst_mac,
+        src_ip,
+        dst_ip,
+        sport,
+        dport,
+        flags="S",
+        hlim=64,
+        seq=0,
+        ack=0,
+        payload=b"\xa5" * 100,
+    ):
+        return (
+            Ether(src=src_mac, dst=dst_mac)
+            / IPv6(src=src_ip, dst=dst_ip, hlim=hlim)
+            / TCP(sport=sport, dport=dport, flags=flags, seq=seq, ack=ack)
+            / Raw(payload)
+        )
+
+    def create_udp6_packet(
+        self, src_mac, dst_mac, src_ip, dst_ip, sport, dport, hlim=64
+    ):
+        return (
+            Ether(src=src_mac, dst=dst_mac)
+            / IPv6(src=src_ip, dst=dst_ip, hlim=hlim)
+            / UDP(sport=sport, dport=dport)
+            / Raw(b"\xa5" * 100)
+        )
+
+    def set_timeout(self, timeout_id, value):
+        self.vapi.sfdp_set_timeout(
+            tenant_id=1, timeout_id=timeout_id, timeout_value=value
+        )
+
+    def sessions(self):
+        return list(self.vapi.sfdp_session_dump())
+
+    def wait_no_sessions(self, timeout=5.0, tick=0.02):
+        steps = int(timeout / tick) + 1
+        for _ in range(steps):
+            if len(self.sessions()) == 0:
+                return
+            self.virtual_sleep(tick)
+        remaining = self.sessions()
+        self.assertEqual(
+            len(remaining),
+            0,
+            f"Sessions still present after {timeout}s: "
+            f"{[(s.session_idx, s.state) for s in remaining]}",
+        )
+
+    def verify_basic_session_state(
+        self,
+        sess,
+        expected_protocol,
+        expected_state,
+        expected_session_type,
+        expected_src_ip=None,
+        expected_dst_ip=None,
+    ):
+        self.assertEqual(
+            sess.protocol, expected_protocol, f"Protocol should be {expected_protocol}"
+        )
+        self.assertEqual(sess.state, expected_state, "Unexpected session state")
+        self.assertEqual(
+            sess.session_type, expected_session_type, "Unexpected session type"
+        )
+
+        if expected_src_ip and expected_dst_ip:
+            detail_output = self.vapi.cli(
+                f"show sfdp session-detail {hex(sess.session_id)}"
+            )
+            self.assertIn(
+                expected_src_ip,
+                detail_output,
+                "cli output does not show expected source IP",
+            )
+            self.assertIn(
+                expected_dst_ip,
+                detail_output,
+                "cli output does not show expected destination IP",
+            )
+
+
+@unittest.skipIf(
+    "sfdp_services" in config.excluded_plugins,
+    "SFDP_Services plugin is required to run SFDP tests",
+)
+class TestSfdp(BaseSfdpTest):
+    """SFDP Infrastructure tests"""
+
+    @classmethod
+    def setUpClass(cls):
+        super(TestSfdp, cls).setUpClass()
+        try:
+            cls.create_pg_interfaces(range(4))
+            for i in cls.pg_interfaces:
+                i.config_ip4()
+                i.config_ip6()
+                i.resolve_arp()
+                i.resolve_ndp()
+                i.admin_up()
+        except Exception:
+            super(TestSfdp, cls).tearDownClass()
+            raise
+
+    @classmethod
+    def tearDownClass(cls):
+        for i in cls.pg_interfaces:
+            i.unconfig_ip4()
+            i.unconfig_ip6()
+            i.admin_down()
+        super(TestSfdp, cls).tearDownClass()
+
+    def _configure_sfdp(self, enable_ip4=True, enable_ip6=False):
+        """Base SFDP Configuration"""
+        self.assertTrue(
+            enable_ip4 or enable_ip6,
+            "SFDP must be configured with either ip4/ip6 enabled",
+        )
+
+        # Add tenant with ID 1 with ip4 support
+        self.tenant_id_ip4 = 1
+        reply = self.vapi.sfdp_tenant_add_del(
+            tenant_id=self.tenant_id_ip4,
+            context_id=1,
+            is_del=False,
+        )
+        self.assertEqual(reply.retval, 0)
+
+        # Add tenant with ID 2 with ip6 support
+        self.tenant_id_ip6 = 2
+        reply = self.vapi.sfdp_tenant_add_del(
+            tenant_id=self.tenant_id_ip6,
+            context_id=1,
+            is_del=False,
+        )
+        self.assertEqual(reply.retval, 0)
+
+        if enable_ip4:
+            # Configure ip4 services - minimal chain for session tracking
+            service_chain = [{"data": "sfdp-l4-lifecycle"}, {"data": "ip4-lookup"}]
+            reply = self.vapi.sfdp_set_services(
+                tenant_id=self.tenant_id_ip4,
+                dir=VppEnum.vl_api_sfdp_session_direction_t.SFDP_API_FORWARD,
+                n_services=len(service_chain),
+                services=service_chain,
+            )
+            self.assertEqual(reply.retval, 0)
+
+            reply = self.vapi.sfdp_set_services(
+                tenant_id=self.tenant_id_ip4,
+                dir=VppEnum.vl_api_sfdp_session_direction_t.SFDP_API_REVERSE,
+                n_services=len(service_chain),
+                services=service_chain,
+            )
+            self.assertEqual(reply.retval, 0)
+
+            reply = self.vapi.sfdp_interface_input_set(
+                sw_if_index=self.pg0.sw_if_index,
+                tenant_id=1,
+                is_disable=False,
+            )
+            self.assertEqual(reply.retval, 0)
+
+            # Verify that SFDP IPv4 feature arc is enabled
+            reply = self.vapi.feature_is_enabled(
+                arc_name="ip4-unicast",
+                feature_name="sfdp-interface-input-ip4",
+                sw_if_index=self.pg0.sw_if_index,
+            )
+            self.assertTrue(reply.is_enabled, "sfdp ip4 feature arc should be enabled")
+
+        if enable_ip6:
+            # Configure ip6 services - minimal chain for session tracking
+            service_chain = [{"data": "sfdp-l4-lifecycle"}, {"data": "ip6-lookup"}]
+            reply = self.vapi.sfdp_set_services(
+                tenant_id=self.tenant_id_ip6,
+                dir=VppEnum.vl_api_sfdp_session_direction_t.SFDP_API_FORWARD,
+                n_services=len(service_chain),
+                services=service_chain,
+            )
+            self.assertEqual(reply.retval, 0)
+
+            reply = self.vapi.sfdp_set_services(
+                tenant_id=self.tenant_id_ip6,
+                dir=VppEnum.vl_api_sfdp_session_direction_t.SFDP_API_REVERSE,
+                n_services=len(service_chain),
+                services=service_chain,
+            )
+            self.assertEqual(reply.retval, 0)
+            reply = self.vapi.sfdp_interface_input_set(
+                sw_if_index=self.pg0.sw_if_index,
+                tenant_id=self.tenant_id_ip6,
+                is_disable=False,
+                is_ip6=True,
+            )
+            self.assertEqual(reply.retval, 0)
+
+            # Verify that SFDP IPv6 feature arc is enabled
+            reply = self.vapi.feature_is_enabled(
+                arc_name="ip6-unicast",
+                feature_name="sfdp-interface-input-ip6",
+                sw_if_index=self.pg0.sw_if_index,
+            )
+            self.assertTrue(reply.is_enabled, "sfdp ip6 feature arc should be enabled")
+
+    def _cleanup_sfdp(self, disable_ip4=True, disable_ip6=False):
+        """Cleanup SFDP configuration"""
+        self.assertTrue(
+            disable_ip4 or disable_ip6, "SFDP must be disabled for either ip4/ip6"
+        )
+        # Expire active sessions
+        self.vapi.sfdp_kill_session(is_all=True)
+        # Sleep one second to ensure expired sessions
+        # are removed by process node 'sfdp_expire_node'
+        self.virtual_sleep(1)
+
+        sessions = self.vapi.sfdp_session_dump()
+        self.assertEqual(
+            len(sessions), 0, "SFDP sessions are still present after cleanup"
+        )
+
+        # Disable SFDP on interfaces
+        if disable_ip4:
+            self.vapi.sfdp_interface_input_set(
+                sw_if_index=self.pg0.sw_if_index,
+                tenant_id=self.tenant_id_ip4,
+                is_disable=True,
+            )
+            # Verify that IPv4 SFDP feature arc is disabled
+            reply = self.vapi.feature_is_enabled(
+                arc_name="ip4-unicast",
+                feature_name="sfdp-interface-input-ip4",
+                sw_if_index=self.pg0.sw_if_index,
+            )
+            self.assertFalse(
+                reply.is_enabled,
+                "sfdp ip4 feature arc should be disabled after cleanup",
+            )
+
+        if disable_ip6:
+            self.vapi.sfdp_interface_input_set(
+                sw_if_index=self.pg0.sw_if_index,
+                tenant_id=self.tenant_id_ip6,
+                is_disable=True,
+                is_ip6=True,
+            )
+            # Verify that IPv6 SFDP feature arc is disabled
+            reply = self.vapi.feature_is_enabled(
+                arc_name="ip6-unicast",
+                feature_name="sfdp-interface-input-ip6",
+                sw_if_index=self.pg0.sw_if_index,
+            )
+            self.assertFalse(
+                reply.is_enabled,
+                "sfdp ip6 feature arc should be disabled after cleanup",
+            )
+
+        # Delete ip4/ip6 tenant
+        self.vapi.sfdp_tenant_add_del(
+            tenant_id=self.tenant_id_ip4,
+            is_del=True,
+        )
+        self.vapi.sfdp_tenant_add_del(
+            tenant_id=self.tenant_id_ip6,
+            is_del=True,
+        )
+
+    def test_sfdp_api_configuration(self):
+        """Test SFDP configuration"""
+        # Dump services to build index mapping and verify scope
+        service_index_by_name = {}
+        services = self.vapi.sfdp_service_dump()
+        for svc in services:
+            service_index_by_name[svc.node_name] = svc.index
+            # Verify all services have 'default' scope
+            self.assertEqual(
+                svc.scope, "default", "Service does not have 'default' scope"
+            )
+
+        # Test tenant add
+        reply = self.vapi.sfdp_tenant_add_del(
+            tenant_id=100,
+            context_id=100,
+            is_del=False,
+        )
+        self.assertEqual(reply.retval, 0)
+
+        # Verify tenant exists via dump
+        tenants = self.vapi.sfdp_tenant_dump()
+        tenant_found = False
+        for t in tenants:
+            if t.context_id == 100:
+                tenant_found = True
+
+        self.assertEqual(len(tenants), 1, "There should only be one tenant")
+        self.assertTrue(tenant_found, "Tenant with id 100 should exist")
+
+        # Test service configuration for forward direction
+        forward_services = ["sfdp-l4-lifecycle", "sfdp-drop"]
+        reply = self.vapi.sfdp_set_services(
+            tenant_id=100,
+            dir=VppEnum.vl_api_sfdp_session_direction_t.SFDP_API_FORWARD,
+            n_services=len(forward_services),
+            services=[{"data": s} for s in forward_services],
+        )
+        self.assertEqual(reply.retval, 0)
+
+        # Test service configuration for reverse direction
+        reverse_services = ["sfdp-drop"]
+        reply = self.vapi.sfdp_set_services(
+            tenant_id=100,
+            dir=VppEnum.vl_api_sfdp_session_direction_t.SFDP_API_REVERSE,
+            n_services=len(reverse_services),
+            services=[{"data": s} for s in reverse_services],
+        )
+        self.assertEqual(reply.retval, 0)
+
+        # Calculate expected bitmaps based on service indices
+        expected_forward_bitmap = 0
+        for service_name in forward_services:
+            idx = service_index_by_name[service_name]
+            expected_forward_bitmap |= 1 << idx
+
+        expected_reverse_bitmap = 0
+        for service_name in reverse_services:
+            idx = service_index_by_name[service_name]
+            expected_reverse_bitmap |= 1 << idx
+
+        # Verify services are set correctly via tenant dump
+        tenants = self.vapi.sfdp_tenant_dump()
+        tenant = tenants[0]
+        self.assertEqual(
+            tenant.forward_bitmap, expected_forward_bitmap, "Forward bitmap mismatch"
+        )
+        self.assertEqual(
+            tenant.reverse_bitmap, expected_reverse_bitmap, "Reverse bitmap mismatch"
+        )
+
+        # Test timeout configuration
+        reply = self.vapi.sfdp_set_timeout(
+            tenant_id=100,
+            timeout_id=0,  # Timeout ID 0 / embryonic
+            timeout_value=31,
+        )
+        self.assertEqual(reply.retval, 0)
+
+        reply = self.vapi.sfdp_set_timeout(
+            tenant_id=100,
+            timeout_id=1,  # Timeout ID 1 / established
+            timeout_value=3601,
+        )
+        self.assertEqual(reply.retval, 0)
+
+        # Verify timeouts are set correctly via tenant dump
+        tenants = self.vapi.sfdp_tenant_dump()
+        tenant = tenants[0]
+        self.assertEqual(tenant.timeout[0], 31, "Timeout ID 0 should be 31 seconds")
+        self.assertEqual(tenant.timeout[1], 3601, "Timeout ID 1 should be 3601 seconds")
+
+        # Test tenant delete
+        reply = self.vapi.sfdp_tenant_add_del(
+            tenant_id=100,
+            is_del=True,
+        )
+        self.assertEqual(reply.retval, 0)
+
+        # Verify tenant is gone
+        tenants = self.vapi.sfdp_tenant_dump()
+        self.assertEqual(len(tenants), 0, "Tenant should not exist after delete")
+
+    def test_sfdp_cli_configuration(self):
+        """Test SFDP configuration through CLI"""
+        # Dump services to build index mapping
+        services = self.vapi.sfdp_service_dump()
+        service_index_by_name = {}
+        for svc in services:
+            service_index_by_name[svc.node_name] = svc.index
+
+        # Test tenant add via CLI
+        self.vapi.cli("sfdp tenant add 200 context 200")
+
+        # Verify tenant exists via dump
+        tenants = self.vapi.sfdp_tenant_dump()
+        tenant_found = False
+        for t in tenants:
+            if t.context_id == 200:
+                tenant_found = True
+
+        self.assertTrue(tenant_found, "Tenant with id 200 should exist")
+        self.assertEqual(len(tenants), 1, "There should only be one tenant")
+
+        # Test service configuration via CLI
+        forward_services = ["sfdp-l4-lifecycle", "ip4-lookup"]
+        reverse_services = ["ip4-lookup"]
+        self.vapi.cli(
+            "set sfdp services tenant 200 sfdp-l4-lifecycle ip4-lookup forward"
+        )
+        self.vapi.cli("set sfdp services tenant 200 ip4-lookup reverse")
+
+        # Calculate expected bitmaps based on service indices
+        expected_forward_bitmap = 0
+        for service_name in forward_services:
+            idx = service_index_by_name[service_name]
+            expected_forward_bitmap |= 1 << idx
+
+        expected_reverse_bitmap = 0
+        for service_name in reverse_services:
+            idx = service_index_by_name[service_name]
+            expected_reverse_bitmap |= 1 << idx
+
+        # Verify services are set correctly via tenant dump
+        tenants = self.vapi.sfdp_tenant_dump()
+        tenant = tenants[0]
+        self.assertEqual(
+            tenant.forward_bitmap, expected_forward_bitmap, "Forward bitmap mismatch"
+        )
+        self.assertEqual(
+            tenant.reverse_bitmap, expected_reverse_bitmap, "Reverse bitmap mismatch"
+        )
+
+        # Test timeout configuration via CLI
+        self.vapi.cli("set sfdp timeout tenant 200 embryonic 35")
+
+        # Verify timeouts are set correctly via tenant dump
+        tenants = self.vapi.sfdp_tenant_dump()
+        tenant = tenants[0]
+
+        self.assertEqual(
+            tenant.timeout[0], 35, "Timeout ID 0 (embryonic) should be 35 seconds"
+        )
+
+        # Test tenant delete via CLI
+        self.vapi.cli("sfdp tenant del 200")
+
+        # Verify tenant is gone
+        tenants = self.vapi.sfdp_tenant_dump()
+        self.assertEqual(len(tenants), 0, "Tenant should not exist after delete")
+
+    def test_sfdp_tcp_session_creation(self):
+        """Test SFDP TCP session creation"""
+        self._configure_sfdp()
+
+        # Send a TCP SYN packet
+        # from pg0 to pg1
+        pkt = self.create_tcp_packet(
+            src_mac=self.pg0.remote_mac,
+            dst_mac=self.pg0.local_mac,
+            src_ip=self.pg0.remote_ip4,
+            dst_ip=self.pg1.remote_ip4,
+            sport=12345,
+            dport=80,
+            flags="S",
+        )
+
+        self.send_and_expect(self.pg0, pkt, self.pg1)
+
+        # Verify session was created
+        sessions = self.vapi.sfdp_session_dump()
+        found = False
+        for sess in sessions:
+            if sess.protocol == 6:  # TCP
+                found = True
+                self.verify_basic_session_state(
+                    sess,
+                    6,
+                    VppEnum.vl_api_sfdp_session_state_t.SFDP_API_SESSION_STATE_FSOL,
+                    VppEnum.vl_api_sfdp_session_type_t.SFDP_API_SESSION_TYPE_IP4,
+                    self.pg0.remote_ip4,
+                    self.pg1.remote_ip4,
+                )
+                break
+
+        self.assertEqual(
+            len(sessions), 1, "There should only be one SFDP session present"
+        )
+        self.assertTrue(found, "TCP session should have been created")
+        self._cleanup_sfdp()
+
+    def test_sfdp_udp_session_creation(self):
+        """Test SFDP UDP session creation"""
+        self._configure_sfdp()
+
+        # Send a UDP packet
+        # from pg0 to pg1
+        pkt = self.create_udp_packet(
+            src_mac=self.pg0.remote_mac,
+            dst_mac=self.pg0.local_mac,
+            src_ip=self.pg0.remote_ip4,
+            dst_ip=self.pg1.remote_ip4,
+            sport=54321,
+            dport=53,
+        )
+
+        self.send_and_expect(self.pg0, pkt, self.pg1)
+
+        # Verify session was created
+        # Find our UDP session
+        sessions = self.vapi.sfdp_session_dump()
+        found = False
+        for sess in sessions:
+            if sess.protocol == 17:  # UDP
+                found = True
+                self.verify_basic_session_state(
+                    sess,
+                    17,
+                    VppEnum.vl_api_sfdp_session_state_t.SFDP_API_SESSION_STATE_FSOL,
+                    VppEnum.vl_api_sfdp_session_type_t.SFDP_API_SESSION_TYPE_IP4,
+                    self.pg0.remote_ip4,
+                    self.pg1.remote_ip4,
+                )
+                break
+
+        self.assertEqual(
+            len(sessions), 1, "There should only be one SFDP session present"
+        )
+        self.assertTrue(found, "UDP session should have been created")
+        self._cleanup_sfdp()
+
+    def test_sfdp_tcp6_session_creation(self):
+        """Test SFDP TCP IPv6 session creation"""
+        self._configure_sfdp(enable_ip6=True)
+
+        # Send IPv6 TCP SYN packet
+        pkt = self.create_tcp6_packet(
+            src_mac=self.pg0.remote_mac,
+            dst_mac=self.pg0.local_mac,
+            src_ip=self.pg0.remote_ip6,
+            dst_ip=self.pg1.remote_ip6,
+            sport=12345,
+            dport=80,
+            flags="S",
+        )
+
+        self.send_and_expect(self.pg0, pkt, self.pg1)
+
+        # Verify session was created
+        sessions = self.vapi.sfdp_session_dump()
+        found = False
+        for sess in sessions:
+            if sess.protocol == 6:  # TCP
+                found = True
+                self.verify_basic_session_state(
+                    sess,
+                    6,
+                    VppEnum.vl_api_sfdp_session_state_t.SFDP_API_SESSION_STATE_FSOL,
+                    VppEnum.vl_api_sfdp_session_type_t.SFDP_API_SESSION_TYPE_IP6,
+                    self.pg0.remote_ip6,
+                    self.pg1.remote_ip6,
+                )
+                break
+
+        self.assertEqual(len(sessions), 1, "There should only be one session present")
+        self.assertTrue(found, "No TCP IPv6 session found")
+        self._cleanup_sfdp(disable_ip6=True)
+
+    def test_sfdp_udp6_session_creation(self):
+        """Test SFDP UDP IPv6 session creation"""
+        self._configure_sfdp(enable_ip6=True)
+
+        # Send IPv6 UDP packet
+        pkt = self.create_udp6_packet(
+            src_mac=self.pg0.remote_mac,
+            dst_mac=self.pg0.local_mac,
+            src_ip=self.pg0.remote_ip6,
+            dst_ip=self.pg1.remote_ip6,
+            sport=54321,
+            dport=53,
+        )
+
+        self.send_and_expect(self.pg0, pkt, self.pg1)
+
+        # Verify session was created
+        sessions = self.vapi.sfdp_session_dump()
+        found = False
+        for sess in sessions:
+            if sess.protocol == 17:  # UDP
+                found = True
+                self.verify_basic_session_state(
+                    sess,
+                    17,
+                    VppEnum.vl_api_sfdp_session_state_t.SFDP_API_SESSION_STATE_FSOL,
+                    VppEnum.vl_api_sfdp_session_type_t.SFDP_API_SESSION_TYPE_IP6,
+                    self.pg0.remote_ip6,
+                    self.pg1.remote_ip6,
+                )
+                break
+
+        self.assertEqual(
+            len(sessions), 1, "There should only be one SFDP session present"
+        )
+        self.assertTrue(found, "UDP IPv6 session should have been created")
+        self._cleanup_sfdp(disable_ip6=True)
+
+    def test_sfdp_tcp46_session_creation(self):
+        """Test SFDP TCP IPv4/IPv6 simultaneous session creation"""
+        self._configure_sfdp(enable_ip4=True, enable_ip6=True)
+
+        pkt_v4 = self.create_tcp_packet(
+            src_mac=self.pg0.remote_mac,
+            dst_mac=self.pg0.local_mac,
+            src_ip=self.pg0.remote_ip4,
+            dst_ip=self.pg1.remote_ip4,
+            sport=12345,
+            dport=80,
+            flags="S",
+        )
+
+        pkt_v6 = self.create_tcp6_packet(
+            src_mac=self.pg0.remote_mac,
+            dst_mac=self.pg0.local_mac,
+            src_ip=self.pg0.remote_ip6,
+            dst_ip=self.pg1.remote_ip6,
+            sport=12345,
+            dport=80,
+            flags="S",
+        )
+
+        # Send IPv4 and IPv6 TCP SYN packets
+        self.send_and_expect(self.pg0, [pkt_v4, pkt_v6], self.pg1)
+
+        # Verify sessions are created
+        sessions = self.vapi.sfdp_session_dump()
+        found_v4 = False
+        found_v6 = False
+        for sess in sessions:
+            if (
+                sess.protocol == 6
+                and sess.session_type
+                == VppEnum.vl_api_sfdp_session_type_t.SFDP_API_SESSION_TYPE_IP4
+            ):  # TCP V4
+                found_v4 = True
+                self.assertEqual(sess.tenant_id, self.tenant_id_ip4)
+                self.verify_basic_session_state(
+                    sess,
+                    6,
+                    VppEnum.vl_api_sfdp_session_state_t.SFDP_API_SESSION_STATE_FSOL,
+                    VppEnum.vl_api_sfdp_session_type_t.SFDP_API_SESSION_TYPE_IP4,
+                    self.pg0.remote_ip4,
+                    self.pg1.remote_ip4,
+                )
+            if (
+                sess.protocol == 6
+                and sess.session_type
+                == VppEnum.vl_api_sfdp_session_type_t.SFDP_API_SESSION_TYPE_IP6
+            ):  # TCP V6
+                found_v6 = True
+                self.assertEqual(sess.tenant_id, self.tenant_id_ip6)
+                self.verify_basic_session_state(
+                    sess,
+                    6,
+                    VppEnum.vl_api_sfdp_session_state_t.SFDP_API_SESSION_STATE_FSOL,
+                    VppEnum.vl_api_sfdp_session_type_t.SFDP_API_SESSION_TYPE_IP6,
+                    self.pg0.remote_ip6,
+                    self.pg1.remote_ip6,
+                )
+
+        self.assertEqual(len(sessions), 2, "There should be two sessions present")
+        self.assertTrue(found_v4, "No TCP IPv4 session found")
+        self.assertTrue(found_v6, "No TCP IPv6 session found")
+        self._cleanup_sfdp(disable_ip4=True, disable_ip6=True)
+
+    def test_sfdp_single_tenant_multiple_tcp_flows(self):
+        """Test single tenant processing multiple TCP flows"""
+        self._configure_sfdp()
+
+        # Create five TCP flows with different source ports
+        packets = []
+        for i in range(5):
+            pkt = self.create_tcp_packet(
+                src_mac=self.pg0.remote_mac,
+                dst_mac=self.pg0.local_mac,
+                src_ip=self.pg0.remote_ip4,
+                dst_ip=self.pg1.remote_ip4,
+                sport=10000 + i,
+                dport=80,
+                flags="S",
+            )
+            packets.append(pkt)
+
+        # Send all packets from pg0 to pg1
+        for pkt in packets:
+            self.send_and_expect(self.pg0, pkt, self.pg1)
+
+        # Verify all sessions were created
+        sessions = self.vapi.sfdp_session_dump()
+
+        self.assertEqual(len(sessions), 5, "Did not get expected number of sessions")
+
+        # Verify all sessions are in FSOL state and belong to tenant 1
+        for sess in sessions:
+            self.assertEqual(sess.tenant_id, 1, "Session should belong to tenant 1")
+            self.verify_basic_session_state(
+                sess,
+                6,
+                VppEnum.vl_api_sfdp_session_state_t.SFDP_API_SESSION_STATE_FSOL,
+                VppEnum.vl_api_sfdp_session_type_t.SFDP_API_SESSION_TYPE_IP4,
+            )
+
+        self._cleanup_sfdp()
+
+    def test_sfdp_multiple_tenants_flows(self):
+        """Test multiple tenants each handling one flow in parallel"""
+        # Configure tenant 1 on pg0
+        reply = self.vapi.sfdp_tenant_add_del(
+            tenant_id=1,
+            context_id=1,
+            is_del=False,
+        )
+        self.assertEqual(reply.retval, 0)
+
+        reply = self.vapi.sfdp_set_services(
+            tenant_id=1,
+            dir=VppEnum.vl_api_sfdp_session_direction_t.SFDP_API_FORWARD,
+            n_services=2,
+            services=[{"data": "sfdp-l4-lifecycle"}, {"data": "ip4-lookup"}],
+        )
+        self.assertEqual(reply.retval, 0)
+
+        reply = self.vapi.sfdp_set_services(
+            tenant_id=1,
+            dir=VppEnum.vl_api_sfdp_session_direction_t.SFDP_API_REVERSE,
+            n_services=2,
+            services=[{"data": "sfdp-l4-lifecycle"}, {"data": "ip4-lookup"}],
+        )
+        self.assertEqual(reply.retval, 0)
+
+        reply = self.vapi.sfdp_interface_input_set(
+            sw_if_index=self.pg0.sw_if_index,
+            tenant_id=1,
+            is_disable=False,
+        )
+        self.assertEqual(reply.retval, 0)
+
+        # Configure tenant 2 on pg1
+        reply = self.vapi.sfdp_tenant_add_del(
+            tenant_id=2,
+            context_id=2,
+            is_del=False,
+        )
+        self.assertEqual(reply.retval, 0)
+
+        reply = self.vapi.sfdp_set_services(
+            tenant_id=2,
+            dir=VppEnum.vl_api_sfdp_session_direction_t.SFDP_API_FORWARD,
+            n_services=2,
+            services=[{"data": "sfdp-l4-lifecycle"}, {"data": "ip4-lookup"}],
+        )
+        self.assertEqual(reply.retval, 0)
+
+        reply = self.vapi.sfdp_set_services(
+            tenant_id=2,
+            dir=VppEnum.vl_api_sfdp_session_direction_t.SFDP_API_REVERSE,
+            n_services=2,
+            services=[{"data": "sfdp-l4-lifecycle"}, {"data": "ip4-lookup"}],
+        )
+        self.assertEqual(reply.retval, 0)
+
+        reply = self.vapi.sfdp_interface_input_set(
+            sw_if_index=self.pg1.sw_if_index,
+            tenant_id=2,
+            is_disable=False,
+        )
+        self.assertEqual(reply.retval, 0)
+
+        # Send TCP SYN on pg0 (tenant 1)
+        pkt1 = self.create_tcp_packet(
+            src_mac=self.pg0.remote_mac,
+            dst_mac=self.pg0.local_mac,
+            src_ip=self.pg0.remote_ip4,
+            dst_ip=self.pg1.remote_ip4,
+            sport=11111,
+            dport=80,
+            flags="S",
+        )
+        self.send_and_expect(self.pg0, pkt1, self.pg1)
+
+        # Send TCP SYN on pg1 (tenant 2)
+        pkt2 = self.create_tcp_packet(
+            src_mac=self.pg1.remote_mac,
+            dst_mac=self.pg1.local_mac,
+            src_ip=self.pg1.remote_ip4,
+            dst_ip=self.pg0.remote_ip4,
+            sport=22222,
+            dport=443,
+            flags="S",
+        )
+        self.send_and_expect(self.pg1, pkt2, self.pg0)
+
+        # Verify sessions were created
+        sessions = self.vapi.sfdp_session_dump()
+
+        self.assertEqual(len(sessions), 2, "Expected 2 sessions in total")
+
+        # Verify each tenant has exactly one session
+        tenant_1_sessions = [s for s in sessions if s.tenant_id == 1]
+        tenant_2_sessions = [s for s in sessions if s.tenant_id == 2]
+
+        self.assertEqual(
+            len(tenant_1_sessions), 1, "Tenant 1 should have exactly 1 session"
+        )
+        self.assertEqual(
+            len(tenant_2_sessions), 1, "Tenant 2 should have exactly 1 session"
+        )
+
+        # Verify both sessions are in FSOL state
+        for sess in sessions:
+            self.verify_basic_session_state(
+                sess,
+                6,
+                VppEnum.vl_api_sfdp_session_state_t.SFDP_API_SESSION_STATE_FSOL,
+                VppEnum.vl_api_sfdp_session_type_t.SFDP_API_SESSION_TYPE_IP4,
+            )
+
+        # Cleanup - expire sessions + wait until they
+        # are deleted by expiry node
+        self.vapi.sfdp_kill_session(is_all=True)
+        self.virtual_sleep(1)
+
+        # Disable SFDP on interfaces
+        self.vapi.sfdp_interface_input_set(
+            sw_if_index=self.pg0.sw_if_index,
+            tenant_id=1,
+            is_disable=True,
+        )
+        self.vapi.sfdp_interface_input_set(
+            sw_if_index=self.pg1.sw_if_index,
+            tenant_id=2,
+            is_disable=True,
+        )
+
+        # Delete tenants
+        self.vapi.sfdp_tenant_add_del(tenant_id=1, is_del=True)
+        self.vapi.sfdp_tenant_add_del(tenant_id=2, is_del=True)
+
+
+@unittest.skipIf(
+    "sfdp_services" in config.excluded_plugins,
+    "SFDP_Services plugin is required to run SFDP tests",
+)
+class TestSfdpTimer(BaseSfdpTest):
+    """SFDP timer wheel behavior"""
+
+    # 20ms makes one wheel turn (2048 slots) in 40.96s.
+    extra_vpp_config = ["sfdp { timer-interval 0.02 }"]
+
+    @classmethod
+    def setUpClass(cls):
+        super(TestSfdpTimer, cls).setUpClass()
+        try:
+            cls.create_pg_interfaces(range(1))
+            cls.pg0.config_ip4()
+            cls.pg0.admin_up()
+        except Exception:
+            super(TestSfdpTimer, cls).tearDownClass()
+            raise
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.pg0.unconfig_ip4()
+        cls.pg0.admin_down()
+        super(TestSfdpTimer, cls).tearDownClass()
+
+    def setUp(self):
+        super(TestSfdpTimer, self).setUp()
+        self.vapi.cli("sfdp tenant add 1 context 100")
+        self.vapi.cli("set sfdp interface-input pg0 tenant 1")
+
+    def tearDown(self):
+        self.vapi.sfdp_kill_session(is_all=True)
+        # One tick to let the expire node process the killed sessions
+        self.virtual_sleep(0.02)
+        self.vapi.cli("set sfdp interface-input pg0 tenant 1 disable")
+        self.vapi.cli("sfdp tenant del 1")
+        super(TestSfdpTimer, self).tearDown()
+
+    def _session_ids(self):
+        # session_idx is the u32 pool index used by the kill API
+        return {sess.session_idx for sess in self.vapi.sfdp_session_dump()}
+
+    def _wait_for_session_appear(self):
+        session_ids = self._session_ids()
+        self.assertTrue(session_ids, "No SFDP session created")
+        return next(iter(session_ids))
+
+    def _wait_for_session_disappear(self, session_id, timeout):
+        self.virtual_sleep(timeout)
+        # Extra tick: ensures the expire node has been dispatched after the
+        # clock advance, without relying on wall-clock time
+        self.virtual_sleep(0.02)
+        self.assertNotIn(session_id, self._session_ids())
+
+    def _send_embryonic_tcp_syn(self, dst_ip, sport):
+        pkt = self.create_tcp_packet(
+            src_mac=self.pg0.remote_mac,
+            dst_mac=self.pg0.local_mac,
+            src_ip=self.pg0.remote_ip4,
+            dst_ip=dst_ip,
+            sport=sport,
+            dport=80,
+            flags="S",
+        )
+        self.pg0.add_stream(pkt)
+        self.pg_enable_capture(self.pg_interfaces)
+        self.pg_start()
+        self.pg0.assert_nothing_captured()
+
+    def test_sfdp_timer_interval_shown_in_status(self):
+        """Configured timer interval is reported by show sfdp status"""
+        status = self.vapi.cli("show sfdp status")
+
+        self.assertRegex(status, r"timer tick interval \(s\): 0?\.020000")
+
+    def test_sfdp_timer_interval_rearm_after_wheel_turn(self):
+        """Session still expires after a rearm beyond one wheel turn"""
+        self.vapi.cli("set sfdp timeout tenant 1 embryonic 50")
+
+        self._send_embryonic_tcp_syn("198.51.100.2", 12346)
+        session_id = self._wait_for_session_appear()
+        self._wait_for_session_disappear(session_id, timeout=55.0)
+
+    def test_sfdp_kill_is_faster_than_timeout(self):
+        """Killing a session expires it within one tick, not after its timeout"""
+        # Very long timeout so natural expiry won't interfere
+        self.vapi.cli("set sfdp timeout tenant 1 embryonic 3600")
+
+        self._send_embryonic_tcp_syn("198.51.100.2", 12346)
+        session_id = self._wait_for_session_appear()
+
+        self.vapi.sfdp_kill_session(
+            session_index=session_id, is_all=False
+        )  # session_id is session_idx (u32)
+
+        # One tick is enough: kill moves the timer to the current wheel slot
+        # and sends an interrupt to the expire node
+        self.virtual_sleep(0.02)
+        self.assertNotIn(session_id, self._session_ids())
+
+    def test_sfdp_kill_all_is_faster_than_timeout(self):
+        """kill_all expires all sessions within one tick"""
+        self.vapi.cli("set sfdp timeout tenant 1 embryonic 3600")
+
+        for sport in [12346, 12347, 12348]:
+            self._send_embryonic_tcp_syn("198.51.100.2", sport)
+
+        session_ids = self._session_ids()
+        self.assertGreater(len(session_ids), 0)
+
+        self.vapi.sfdp_kill_session(is_all=True)
+
+        self.virtual_sleep(0.02)
+        self.assertEqual(len(self._session_ids()), 0)
+
+    def test_sfdp_kill_rearmed_session(self):
+        """Killing a rearmed session (past first wheel revolution) works within one tick"""
+        # Timeout > one wheel turn (2048 * 0.02 = 40.96s) to force a rearm
+        self.vapi.cli("set sfdp timeout tenant 1 embryonic 50")
+
+        self._send_embryonic_tcp_syn("198.51.100.2", 12346)
+        session_id = self._wait_for_session_appear()
+
+        # Advance past the first wheel revolution: session is rearmed, still alive
+        self.virtual_sleep(41)
+        self.assertIn(session_id, self._session_ids())
+
+        # Kill it: should be gone within one tick despite the rearmed state
+        self.vapi.sfdp_kill_session(
+            session_index=session_id, is_all=False
+        )  # session_id is session_idx (u32)
+        self.virtual_sleep(0.02)
+        self.assertNotIn(session_id, self._session_ids())
+
+
+if __name__ == "__main__":
+    unittest.main(testRunner=VppTestRunner)

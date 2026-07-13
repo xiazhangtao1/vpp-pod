@@ -1,0 +1,12 @@
+---
+extra-config:
+  - configured-by-host: false
+devices:
+  - name: "htapvpp"
+    type: "tap"
+    ip4:
+      network: 1
+    host:
+      name: "htaphost"
+      ip4:
+        network: 1

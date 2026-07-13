@@ -1,0 +1,421 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2020 Cisco and/or its affiliates.
+ */
+
+#include <cnat/cnat_types.h>
+#include <cnat/cnat_inline.h>
+
+cnat_main_t cnat_main;
+cnat_timestamp_mpool_t cnat_timestamps;
+
+char *cnat_error_strings[] = {
+#define cnat_error(n,s) s,
+#include <cnat/cnat_error.def>
+#undef cnat_error
+};
+
+u8 *
+format_cnat_5tuple (u8 *s, va_list *args)
+{
+  const cnat_5tuple_t *tuple = va_arg (*args, cnat_5tuple_t *);
+  s = format (s, "%U [%U;%u -> %U;%u]", format_ip_protocol, tuple->iproto, format_ip46_address,
+	      &tuple->ip[VLIB_RX], IP46_TYPE_ANY, clib_net_to_host_u16 (tuple->port[VLIB_RX]),
+	      format_ip46_address, &tuple->ip[VLIB_TX], IP46_TYPE_ANY,
+	      clib_net_to_host_u16 (tuple->port[VLIB_TX]));
+  return (s);
+}
+
+u8 *
+format_cnat_rewrite (u8 *s, va_list *args)
+{
+  cnat_timestamp_rewrite_t *rw = va_arg (*args, cnat_timestamp_rewrite_t *);
+
+  s = format (s, "%U node:%u lbi:%u fl:%u fib:%u", format_cnat_5tuple, &rw->tuple,
+	      rw->cts_dpoi_next_node, rw->cts_lbi, rw->cts_flags, rw->rw_fib_index);
+
+  return (s);
+}
+
+u8 *
+format_cnat_rewrite_type (u8 *s, va_list *args)
+{
+  int rw_type = va_arg (*args, int);
+  switch (rw_type)
+    {
+    case CNAT_LOCATION_INPUT:
+      return format (s, " in ");
+    case CNAT_LOCATION_OUTPUT:
+      return format (s, " out");
+    case CNAT_LOCATION_FIB:
+      return format (s, " fib");
+    case CNAT_LOCATION_INPUT + CNAT_IS_RETURN:
+      return format (s, "rin ");
+    case CNAT_LOCATION_OUTPUT + CNAT_IS_RETURN:
+      return format (s, "rout");
+    case CNAT_LOCATION_FIB + CNAT_IS_RETURN:
+      return format (s, "rfib");
+    default:
+      return format (s, "unknown");
+    }
+}
+
+u8
+cnat_resolve_addr (u32 sw_if_index, ip_address_family_t af,
+		   ip_address_t * addr)
+{
+  /* Tries to resolve IP from sw_if_index
+   * returns 1 if we need to schedule DHCP */
+  if (INDEX_INVALID == sw_if_index)
+    return 0;
+  if (af == AF_IP6)
+    {
+      ip6_address_t *ip6 = 0;
+      ip6 = ip6_interface_first_address (&ip6_main, sw_if_index);
+      if (ip6)
+	{
+	  ip_address_set (addr, ip6, AF_IP6);
+	  return 0;
+	}
+      else
+	return 1;
+    }
+  else
+    {
+      ip4_address_t *ip4 = 0;
+      ip4 = ip4_interface_first_address (&ip4_main, sw_if_index, 0);
+      if (ip4)
+	{
+	  ip_address_set (addr, ip4, AF_IP4);
+	  return 0;
+	}
+      else
+	return 1;
+    }
+}
+
+u8
+cnat_resolve_ep (cnat_endpoint_t * ep)
+{
+  int rv;
+  rv = cnat_resolve_addr (ep->ce_sw_if_index, ep->ce_ip.version, &ep->ce_ip);
+  if (0 == rv)
+    ep->ce_flags |= CNAT_EP_FLAG_RESOLVED;
+  return rv;
+}
+
+uword
+unformat_cnat_ep (unformat_input_t * input, va_list * args)
+{
+  cnat_endpoint_t *a = va_arg (*args, cnat_endpoint_t *);
+  vnet_main_t *vnm = vnet_get_main ();
+  int port = 0;
+
+  clib_memset (a, 0, sizeof (*a));
+  a->ce_sw_if_index = INDEX_INVALID;
+  if (unformat (input, "%U %d", unformat_ip_address, &a->ce_ip, &port))
+    ;
+  else if (unformat_user (input, unformat_ip_address, &a->ce_ip))
+    ;
+  else if (unformat (input, "%U v6 %d", unformat_vnet_sw_interface,
+		     vnm, &a->ce_sw_if_index, &port))
+    a->ce_ip.version = AF_IP6;
+  else if (unformat (input, "%U v6", unformat_vnet_sw_interface,
+		     vnm, &a->ce_sw_if_index))
+    a->ce_ip.version = AF_IP6;
+  else if (unformat (input, "%U %d", unformat_vnet_sw_interface,
+		     vnm, &a->ce_sw_if_index, &port))
+    a->ce_ip.version = AF_IP4;
+  else if (unformat_user (input, unformat_vnet_sw_interface,
+			  vnm, &a->ce_sw_if_index))
+    a->ce_ip.version = AF_IP4;
+  else if (unformat (input, "%d", &port))
+    ;
+  else
+    return 0;
+  a->ce_port = (u16) port;
+  return 1;
+}
+
+uword
+unformat_cnat_ep_flags (unformat_input_t *input, va_list *args)
+{
+  int *a = va_arg (*args, int *);
+  if (unformat (input, ":nonat"))
+    *a = CNAT_TRK_FLAG_NO_NAT;
+  return 1;
+}
+
+uword
+unformat_cnat_ep_tuple (unformat_input_t * input, va_list * args)
+{
+  cnat_endpoint_tuple_t *a = va_arg (*args, cnat_endpoint_tuple_t *);
+  int flgs = 0;
+  if (unformat (input, "%U->%U%U", unformat_cnat_ep, &a->src_ep,
+		unformat_cnat_ep, &a->dst_ep, unformat_cnat_ep_flags, &flgs))
+    a->ep_flags = flgs;
+  else if (unformat (input, "->%U%U", unformat_cnat_ep, &a->dst_ep,
+		     unformat_cnat_ep_flags, &flgs))
+    a->ep_flags = flgs;
+  else if (unformat (input, "%U->%U", unformat_cnat_ep, &a->src_ep,
+		     unformat_cnat_ep_flags, &flgs))
+    a->ep_flags = flgs;
+  else
+    return 0;
+  return 1;
+}
+
+u8 *
+format_cnat_endpoint (u8 * s, va_list * args)
+{
+  cnat_endpoint_t *cep = va_arg (*args, cnat_endpoint_t *);
+  vnet_main_t *vnm = vnet_get_main ();
+  if (INDEX_INVALID == cep->ce_sw_if_index)
+    s = format (s, "%U;%d", format_ip_address, &cep->ce_ip, cep->ce_port);
+  else
+    {
+      if (cep->ce_flags & CNAT_EP_FLAG_RESOLVED)
+	s = format (s, "%U (%U);%d", format_vnet_sw_if_index_name, vnm,
+		    cep->ce_sw_if_index, format_ip_address, &cep->ce_ip,
+		    cep->ce_port);
+      else
+	s =
+	  format (s, "%U (%U);%d", format_vnet_sw_if_index_name, vnm,
+		  cep->ce_sw_if_index, format_ip_address_family,
+		  cep->ce_ip.version, cep->ce_port);
+    }
+  return (s);
+}
+
+int
+cnat_endpoint_cmp (cnat_endpoint_t *ep1, cnat_endpoint_t *ep2)
+{
+  return ip_address_cmp (&ep1->ce_ip, &ep2->ce_ip) || (ep1->ce_port != ep2->ce_port) ||
+	 (ep1->ce_sw_if_index != ep2->ce_sw_if_index);
+}
+
+void
+cnat_enable_disable_scanner (cnat_scanner_cmd_t event_type)
+{
+  vlib_main_t *vm = vlib_get_main ();
+  vlib_process_signal_event (vm, cnat_main.scanner_node_index, event_type, 0);
+}
+
+static void
+init_session_per_vrf_v4 (ip4_main_t *im, uword opaque, u32 sw_if_index, u32 new_fib_index,
+			 u32 old_fib_index)
+{
+  cnat_timestamp_mpool_t *ctm = &cnat_timestamps;
+  vec_validate_init_empty_aligned (ctm->sessions_per_vrf_ip4, new_fib_index,
+				   ctm->max_sessions_per_vrf, CLIB_CACHE_LINE_BYTES);
+}
+
+static void
+init_session_per_vrf_v6 (ip6_main_t *im, uword opaque, u32 sw_if_index, u32 new_fib_index,
+			 u32 old_fib_index)
+{
+  cnat_timestamp_mpool_t *ctm = &cnat_timestamps;
+  vec_validate_init_empty_aligned (ctm->sessions_per_vrf_ip6, new_fib_index,
+				   ctm->max_sessions_per_vrf, CLIB_CACHE_LINE_BYTES);
+}
+
+void
+cnat_lazy_init (void)
+{
+  cnat_timestamp_mpool_t *ctm = &cnat_timestamps;
+  cnat_main_t *cm = &cnat_main;
+
+  if (cm->lazy_init_done)
+    return;
+
+  ip4_table_bind_callback_t cb4 = {
+    .function = init_session_per_vrf_v4,
+  };
+  vec_add1 (ip4_main.table_bind_callbacks, cb4);
+
+  ip6_table_bind_callback_t cb6 = {
+    .function = init_session_per_vrf_v6,
+  };
+  vec_add1 (ip6_main.table_bind_callbacks, cb6);
+
+  clib_rwlock_init (&ctm->ts_lock);
+  cnat_ep_trk_t *eptrk;
+  /* Reserve index 0 as CNAT_EP_TRK_INVALID_INDEX, mirroring the timestamp
+   * pool convention. cnat_load_balance returns 0 on miss, callers check
+   * trk_i == CNAT_EP_TRK_INVALID_INDEX before dereferencing. */
+  pool_get (cnat_ep_trk_pool, eptrk);
+  ASSERT (eptrk - cnat_ep_trk_pool == CNAT_EP_TRK_INVALID_INDEX);
+  /* timestamp 0 is default */
+  cnat_timestamp_alloc (CNAT_FIB_TABLE, false /* is_v6 */);
+  /* timestamp 0 should not count toward per vrf limit */
+  vec_elt (ctm->sessions_per_vrf_ip4, 0)++;
+
+  cnat_enable_disable_scanner (cm->default_scanner_state);
+
+  cm->lazy_init_done = 1;
+}
+
+static clib_error_t *
+cnat_config (vlib_main_t * vm, unformat_input_t * input)
+{
+  u32 log2_pool_sz = CNAT_DEFAULT_TS_LOG2_POOL_SZ;
+  cnat_timestamp_mpool_t *ctm = &cnat_timestamps;
+  u32 session_max = CNAT_MAX_SESSIONS;
+  cnat_main_t *cm = &cnat_main;
+
+  cm->translation_hash_memory = CNAT_DEFAULT_TRANSLATION_MEMORY;
+  cm->translation_hash_buckets = CNAT_DEFAULT_TRANSLATION_BUCKETS;
+  cm->client_hash_memory = CNAT_DEFAULT_CLIENT_MEMORY;
+  cm->client_hash_buckets = CNAT_DEFAULT_CLIENT_BUCKETS;
+  cm->snat_hash_memory = CNAT_DEFAULT_SNAT_MEMORY;
+  cm->snat_hash_buckets = CNAT_DEFAULT_SNAT_BUCKETS;
+  cm->snat_if_map_length = CNAT_DEFAULT_SNAT_IF_MAP_LEN;
+  cm->scanner_timeout = CNAT_DEFAULT_SCANNER_TIMEOUT;
+  cm->session_max_age = CNAT_DEFAULT_SESSION_MAX_AGE;
+  cm->tcp_max_age = CNAT_DEFAULT_TCP_MAX_AGE;
+  cm->session_max_port_retries = CNAT_DEFAULT_SESSION_MAX_PORT_RETRIES;
+  cm->default_scanner_state = CNAT_SCANNER_ON;
+  cm->maglev_len = CNAT_DEFAULT_MAGLEV_LEN;
+  cm->lazy_init_done = 0;
+
+  while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (input, "translation-db-buckets %u", &cm->translation_hash_buckets))
+	;
+      else if (unformat (input, "translation-db-memory %U",
+			 unformat_memory_size, &cm->translation_hash_memory))
+	;
+      else if (unformat (input, "client-db-buckets %u",
+			 &cm->client_hash_buckets))
+	;
+      else if (unformat (input, "client-db-memory %U", unformat_memory_size,
+			 &cm->client_hash_memory))
+	;
+      else if (unformat (input, "snat-db-buckets %u", &cm->snat_hash_buckets))
+	;
+      else if (unformat (input, "snat-if-map-len %u", &cm->snat_if_map_length))
+	;
+      else if (unformat (input, "snat-db-memory %U",
+			 unformat_memory_size, &cm->snat_hash_memory))
+	;
+      else if (unformat (input, "session-cleanup-timeout %f",
+			 &cm->scanner_timeout))
+	;
+      else if (unformat (input, "scanner off"))
+	cm->default_scanner_state = CNAT_SCANNER_OFF;
+      else if (unformat (input, "scanner on"))
+	cm->default_scanner_state = CNAT_SCANNER_ON;
+      else if (unformat (input, "session-max-age %u", &cm->session_max_age))
+	;
+      else if (unformat (input, "tcp-max-age %u", &cm->tcp_max_age))
+	;
+      else if (unformat (input, "session-max-port-retries %u", &cm->session_max_port_retries))
+	;
+      else if (unformat (input, "maglev-len %u", &cm->maglev_len))
+	;
+      else if (unformat (input, "session-log2-pool-size %u", &log2_pool_sz))
+	;
+      else if (unformat (input, "session-max %u", &session_max))
+	;
+      else if (unformat (input, "session-max-per-vrf %u", &ctm->max_sessions_per_vrf))
+	;
+      else
+	return clib_error_return (0, "unknown input '%U'",
+				  format_unformat_error, input);
+    }
+
+  if (session_max > CNAT_MAX_SESSIONS)
+    return clib_error_return (0, "cnat session-max %u > %u", session_max, CNAT_MAX_SESSIONS);
+
+  if (0 == ctm->max_sessions_per_vrf)
+    ctm->max_sessions_per_vrf = session_max;
+  else if (ctm->max_sessions_per_vrf > session_max)
+    return clib_error_return (0, "cnat session-max-per-vrf %u > %u", ctm->max_sessions_per_vrf,
+			      session_max);
+
+  /* session index is 32-bits and made of pool index + object index */
+  u64 smax = session_max + (1ULL << log2_pool_sz) - 1;
+  if (smax > CLIB_U32_MAX)
+    return clib_error_return (0, "cnat session-max and session-log2-pool-size are incompatible");
+
+  ctm->pool_max = smax >> log2_pool_sz;
+  ctm->log2_pool_sz = log2_pool_sz;
+  return 0;
+}
+
+int
+cnat_sw_interface_enable_disable (u32 sw_if_index, u8 enable)
+{
+  cnat_lazy_init ();
+  vnet_feature_enable_disable ("ip4-unicast", "cnat-input-ip4", sw_if_index, enable, 0, 0);
+  vnet_feature_enable_disable ("ip4-unicast", "cnat-lookup-ip4", sw_if_index, enable, 0, 0);
+  vnet_feature_enable_disable ("ip6-unicast", "cnat-input-ip6", sw_if_index, enable, 0, 0);
+  vnet_feature_enable_disable ("ip6-unicast", "cnat-lookup-ip6", sw_if_index, enable, 0, 0);
+  vnet_feature_enable_disable ("ip4-output", "cnat-output-ip4", sw_if_index, enable, 0, 0);
+  vnet_feature_enable_disable ("ip4-output", "cnat-writeback-ip4", sw_if_index, enable, 0, 0);
+  vnet_feature_enable_disable ("ip6-output", "cnat-output-ip6", sw_if_index, enable, 0, 0);
+  vnet_feature_enable_disable ("ip6-output", "cnat-writeback-ip6", sw_if_index, enable, 0, 0);
+  return (0);
+}
+
+static clib_error_t *
+cnat_set_cnat_feature_cli (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
+{
+  unformat_input_t _line_input, *line_input = &_line_input;
+  vnet_main_t *vnm = vnet_get_main ();
+  clib_error_t *e = 0;
+  u32 sw_if_index = INDEX_INVALID;
+  u8 enable = 1;
+  int rv;
+
+  cnat_lazy_init ();
+
+  if (!unformat_user (input, unformat_line_input, line_input))
+    return 0;
+
+  while (unformat_check_input (line_input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat_user (line_input, unformat_vnet_sw_interface, vnm, &sw_if_index))
+	;
+      else if (unformat (line_input, "enable"))
+	enable = 1;
+      else if (unformat (line_input, "disable"))
+	enable = 0;
+      else
+	{
+	  e = clib_error_return (0, "unknown input '%U'", format_unformat_error, line_input);
+	  goto done;
+	}
+    }
+
+  if (sw_if_index == INDEX_INVALID)
+    {
+      e = clib_error_return (0, "interface not specified");
+      goto done;
+    }
+
+  rv = cnat_sw_interface_enable_disable (sw_if_index, enable);
+  if (rv)
+    {
+      e = clib_error_return (0, "unknown error %d", rv);
+      goto done;
+    }
+
+done:
+  unformat_free (line_input);
+  return (e);
+}
+
+VLIB_CLI_COMMAND (cnat_set_cnat_feature_command, static) = {
+  .path = "set cnat feature",
+  .short_help = "set cnat feature <interface> [enable|disable]",
+  .function = cnat_set_cnat_feature_cli,
+};
+
+cnat_main_t *
+cnat_get_main ()
+{
+  return &cnat_main;
+}
+
+VLIB_EARLY_CONFIG_FUNCTION (cnat_config, "cnat");

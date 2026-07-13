@@ -1,0 +1,406 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2021 Intel and/or its affiliates.
+ * Copyright (c) 2026 Cisco and/or its affiliates.
+ */
+
+#include <vnet/crypto/crypto.h>
+#include <vnet/tls/tls.h>
+#include <picotls/openssl.h>
+#include <picotls.h>
+
+#include <tlspicotls/pico_vpp_crypto.h>
+#include <tlspicotls/tls_picotls.h>
+
+typedef void (*ptls_vpp_do_transform_fn) (ptls_cipher_context_t *, void *,
+					  const void *, size_t);
+
+vnet_crypto_main_t *cm = &crypto_main;
+extern picotls_main_t picotls_main;
+
+struct cipher_context_t
+{
+  ptls_cipher_context_t super;
+  vnet_crypto_op_t op;
+  vnet_crypto_op_type_t type;
+  vnet_crypto_ctx_t *ctx;
+};
+
+struct vpp_aead_context_t
+{
+  ptls_aead_context_t super;
+  EVP_CIPHER_CTX *evp_ctx;
+  uint8_t static_iv[PTLS_MAX_IV_SIZE];
+  vnet_crypto_op_t op;
+  vnet_crypto_ctx_t *ctx;
+  vnet_crypto_op_type_t type;
+  vnet_crypto_op_chunk_t chunks[2];
+  vnet_crypto_alg_t alg;
+  u32 chunk_index;
+  uint8_t iv[PTLS_MAX_IV_SIZE];
+};
+
+static void
+ptls_vpp_crypto_cipher_do_init (ptls_cipher_context_t * _ctx, const void *iv)
+{
+  struct cipher_context_t *ctx = (struct cipher_context_t *) _ctx;
+
+  vnet_crypto_op_init (ctx->ctx, &ctx->op);
+  ctx->op.type = ctx->type;
+  ctx->op.iv = (u8 *) iv;
+}
+
+static void
+ptls_vpp_crypto_cipher_dispose (ptls_cipher_context_t * _ctx)
+{
+  /* Do nothing */
+}
+
+static void
+ptls_vpp_crypto_cipher_encrypt (ptls_cipher_context_t * _ctx, void *output,
+				const void *input, size_t _len)
+{
+  vlib_main_t *vm = vlib_get_main ();
+  struct cipher_context_t *ctx = (struct cipher_context_t *) _ctx;
+
+  ctx->op.src = (u8 *) input;
+  ctx->op.dst = output;
+  ctx->op.len = _len;
+
+  vnet_crypto_process_ops (vm, &ctx->op, 0, 1);
+}
+
+static int
+ptls_vpp_crypto_cipher_setup_crypto (ptls_cipher_context_t * _ctx, int is_enc,
+				     const void *key,
+				     const EVP_CIPHER * cipher,
+				     ptls_vpp_do_transform_fn do_transform)
+{
+  struct cipher_context_t *ctx = (struct cipher_context_t *) _ctx;
+
+  ctx->super.do_dispose = ptls_vpp_crypto_cipher_dispose;
+  ctx->super.do_init = ptls_vpp_crypto_cipher_do_init;
+  ctx->super.do_transform = do_transform;
+
+  vnet_crypto_alg_t algo;
+  if (!strcmp (ctx->super.algo->name, "AES128-CTR"))
+    {
+      algo = VNET_CRYPTO_ALG_AES_128_CTR;
+      ctx->type = is_enc ? VNET_CRYPTO_OP_TYPE_ENCRYPT : VNET_CRYPTO_OP_TYPE_DECRYPT;
+    }
+  else if (!strcmp (ctx->super.algo->name, "AES256-CTR"))
+    {
+      algo = VNET_CRYPTO_ALG_AES_256_CTR;
+      ctx->type = is_enc ? VNET_CRYPTO_OP_TYPE_ENCRYPT : VNET_CRYPTO_OP_TYPE_DECRYPT;
+    }
+  else
+    {
+      TLS_DBG (1, "%s, Invalid crypto cipher : ", __func__, _ctx->algo->name);
+      assert (0);
+    }
+
+  clib_rwlock_writer_lock (&picotls_main.crypto_keys_rw_lock);
+  ctx->ctx = vnet_crypto_ctx_create (algo);
+  if (ctx->ctx)
+    vnet_crypto_ctx_set_cipher_key (ctx->ctx, key, _ctx->algo->key_size);
+  clib_rwlock_writer_unlock (&picotls_main.crypto_keys_rw_lock);
+
+  return 0;
+}
+
+size_t
+ptls_vpp_crypto_aead_decrypt (ptls_aead_context_t *_ctx, void *_output,
+			      const void *input, size_t inlen, uint64_t seq,
+			      const void *aad, size_t aadlen)
+{
+  vlib_main_t *vm = vlib_get_main ();
+  struct vpp_aead_context_t *ctx = (struct vpp_aead_context_t *) _ctx;
+  int tag_size = ctx->super.algo->tag_size;
+
+  vnet_crypto_op_init (ctx->ctx, &ctx->op);
+  ctx->op.type = ctx->type;
+  ctx->op.aad = (u8 *) aad;
+  ctx->op.aad_len = aadlen;
+  ctx->op.iv = ctx->iv;
+  ptls_aead__build_iv (ctx->super.algo, ctx->op.iv, ctx->static_iv, seq);
+  ctx->op.src = (u8 *) input;
+  ctx->op.dst = _output;
+  ctx->op.len = inlen - tag_size;
+  ctx->op.auth_len = tag_size;
+  ctx->op.auth = ctx->op.src + ctx->op.len;
+
+  vnet_crypto_process_ops (vm, &(ctx->op), 0, 1);
+  assert (ctx->op.status == VNET_CRYPTO_OP_STATUS_COMPLETED);
+
+  return ctx->op.len;
+}
+
+static void
+ptls_vpp_crypto_aead_get_iv (ptls_aead_context_t *_ctx, void *iv)
+{
+  struct vpp_aead_context_t *ctx = (struct vpp_aead_context_t *) _ctx;
+
+  clib_memcpy (iv, ctx->static_iv, ctx->super.algo->iv_size);
+}
+
+static void
+ptls_vpp_crypto_aead_set_iv (ptls_aead_context_t *_ctx, const void *iv)
+{
+  struct vpp_aead_context_t *ctx = (struct vpp_aead_context_t *) _ctx;
+
+  clib_memcpy (ctx->static_iv, iv, ctx->super.algo->iv_size);
+}
+
+static void
+ptls_vpp_crypto_aead_encrypt_init (ptls_aead_context_t *_ctx, uint64_t seq,
+				   const void *aad, size_t aadlen)
+{
+  struct vpp_aead_context_t *ctx = (struct vpp_aead_context_t *) _ctx;
+
+  vnet_crypto_op_init (ctx->ctx, &ctx->op);
+  ctx->op.type = ctx->type;
+  ctx->op.aad = (void *) aad;
+  ctx->op.aad_len = aadlen;
+  ctx->op.iv = ctx->iv;
+  ptls_aead__build_iv (ctx->super.algo, ctx->op.iv, ctx->static_iv, seq);
+  ctx->op.n_chunks = 0;
+  ctx->op.chunk_index = 0;
+  ctx->chunk_index = 0;
+
+  ctx->op.flags |= VNET_CRYPTO_OP_FLAG_CHAINED_BUFFERS;
+}
+
+static size_t
+ptls_vpp_crypto_aead_encrypt_update (ptls_aead_context_t * _ctx, void *output,
+				     const void *input, size_t inlen)
+{
+  struct vpp_aead_context_t *ctx = (struct vpp_aead_context_t *) _ctx;
+
+  ASSERT (ctx->chunk_index < ARRAY_LEN (ctx->chunks));
+  ctx->chunks[ctx->chunk_index].dst = output;
+  ctx->chunks[ctx->chunk_index].src = (void *) input;
+  ctx->chunks[ctx->chunk_index].len = inlen;
+
+  ctx->chunk_index++;
+  ctx->op.n_chunks = ctx->chunk_index;
+
+  return inlen;
+}
+
+static size_t
+ptls_vpp_crypto_aead_encrypt_final (ptls_aead_context_t * _ctx, void *_output)
+{
+  vlib_main_t *vm = vlib_get_main ();
+  struct vpp_aead_context_t *ctx = (struct vpp_aead_context_t *) _ctx;
+
+  ctx->op.auth = _output;
+  ctx->op.auth_len = ctx->super.algo->tag_size;
+
+  vnet_crypto_process_ops (vm, &(ctx->op), ctx->chunks, 1);
+  assert (ctx->op.status == VNET_CRYPTO_OP_STATUS_COMPLETED);
+
+  return ctx->super.algo->tag_size;
+}
+
+static void
+ptls_vpp_crypto_aead_encrypt_v (ptls_aead_context_t *_ctx, void *_output, ptls_iovec_t *input,
+				size_t incnt, uint64_t seq, const void *aad, size_t aadlen)
+{
+  vlib_main_t *vm = vlib_get_main ();
+  struct vpp_aead_context_t *ctx = (struct vpp_aead_context_t *) _ctx;
+  u8 *tmp = 0, *src = _output;
+  size_t inlen = 0, off = 0;
+
+  for (size_t i = 0; i < incnt; i++)
+    inlen += input[i].len;
+
+  if (!inlen)
+    src = _output;
+  else if (incnt == 1)
+    src = input[0].base;
+  else
+    {
+      vec_validate (tmp, inlen - 1);
+      for (size_t i = 0; i < incnt; i++)
+	{
+	  if (input[i].len)
+	    clib_memcpy_fast (tmp + off, input[i].base, input[i].len);
+	  off += input[i].len;
+	}
+      src = tmp;
+    }
+
+  vnet_crypto_op_init (ctx->ctx, &ctx->op);
+  ctx->op.type = ctx->type;
+  ctx->op.aad = (u8 *) aad;
+  ctx->op.aad_len = aadlen;
+  ctx->op.iv = ctx->iv;
+  ptls_aead__build_iv (ctx->super.algo, ctx->op.iv, ctx->static_iv, seq);
+  ctx->op.src = src;
+  ctx->op.dst = _output;
+  ctx->op.len = inlen;
+  ctx->op.auth_len = ctx->super.algo->tag_size;
+  ctx->op.auth = (u8 *) _output + inlen;
+
+  vnet_crypto_process_ops (vm, &ctx->op, 0, 1);
+  assert (ctx->op.status == VNET_CRYPTO_OP_STATUS_COMPLETED);
+  vec_free (tmp);
+}
+
+static void
+ptls_vpp_crypto_aead_dispose_crypto (ptls_aead_context_t * _ctx)
+{
+  vlib_main_t *vm = vlib_get_main ();
+  struct vpp_aead_context_t *ctx = (struct vpp_aead_context_t *) _ctx;
+
+  clib_rwlock_writer_lock (&picotls_main.crypto_keys_rw_lock);
+  vnet_crypto_ctx_destroy (vm, ctx->ctx);
+  clib_rwlock_writer_unlock (&picotls_main.crypto_keys_rw_lock);
+}
+
+static int
+ptls_vpp_crypto_aead_setup_crypto (ptls_aead_context_t *_ctx, int is_enc,
+				   const void *key, const void *iv,
+				   vnet_crypto_alg_t alg)
+{
+  struct vpp_aead_context_t *ctx = (struct vpp_aead_context_t *) _ctx;
+  u16 key_len = ctx->super.algo->key_size;
+
+  if (alg == VNET_CRYPTO_ALG_AES_128_GCM)
+    {
+      ctx->type = is_enc ? VNET_CRYPTO_OP_TYPE_ENCRYPT : VNET_CRYPTO_OP_TYPE_DECRYPT;
+    }
+  else if (alg == VNET_CRYPTO_ALG_AES_256_GCM)
+    {
+      ctx->type = is_enc ? VNET_CRYPTO_OP_TYPE_ENCRYPT : VNET_CRYPTO_OP_TYPE_DECRYPT;
+    }
+  else
+    {
+      TLS_DBG (1, "%s, invalied aead cipher %s", __func__, _ctx->algo->name);
+      return -1;
+    }
+
+  ctx->alg = alg;
+  ctx->chunk_index = 0;
+  clib_memcpy (ctx->static_iv, iv, ctx->super.algo->iv_size);
+  ctx->super.do_get_iv = ptls_vpp_crypto_aead_get_iv;
+  ctx->super.do_set_iv = ptls_vpp_crypto_aead_set_iv;
+
+  clib_rwlock_writer_lock (&picotls_main.crypto_keys_rw_lock);
+  ctx->ctx = vnet_crypto_ctx_create (alg);
+  if (ctx->ctx)
+    vnet_crypto_ctx_set_cipher_key (ctx->ctx, key, key_len);
+  clib_rwlock_writer_unlock (&picotls_main.crypto_keys_rw_lock);
+
+  if (is_enc)
+    {
+      ctx->super.do_encrypt_init = ptls_vpp_crypto_aead_encrypt_init;
+      ctx->super.do_encrypt_update = ptls_vpp_crypto_aead_encrypt_update;
+      ctx->super.do_encrypt_final = ptls_vpp_crypto_aead_encrypt_final;
+      ctx->super.do_encrypt = ptls_aead__do_encrypt;
+      ctx->super.do_encrypt_v = ptls_vpp_crypto_aead_encrypt_v;
+    }
+  else
+    {
+      ctx->super.do_decrypt = ptls_vpp_crypto_aead_decrypt;
+    }
+  ctx->super.dispose_crypto = ptls_vpp_crypto_aead_dispose_crypto;
+
+  return 0;
+}
+
+static int
+ptls_vpp_crypto_aes128ctr_setup_crypto (ptls_cipher_context_t * ctx,
+					int is_enc, const void *key)
+{
+  return ptls_vpp_crypto_cipher_setup_crypto (ctx, is_enc, key, EVP_aes_128_ctr (),
+					      ptls_vpp_crypto_cipher_encrypt);
+}
+
+static int
+ptls_vpp_crypto_aes256ctr_setup_crypto (ptls_cipher_context_t * ctx,
+					int is_enc, const void *key)
+{
+  return ptls_vpp_crypto_cipher_setup_crypto (ctx, is_enc, key, EVP_aes_256_ctr (),
+					      ptls_vpp_crypto_cipher_encrypt);
+}
+
+static int
+ptls_vpp_crypto_aead_aes128gcm_setup_crypto (ptls_aead_context_t *ctx,
+					     int is_enc, const void *key,
+					     const void *iv)
+{
+  return ptls_vpp_crypto_aead_setup_crypto (ctx, is_enc, key, iv,
+					    VNET_CRYPTO_ALG_AES_128_GCM);
+}
+
+static int
+ptls_vpp_crypto_aead_aes256gcm_setup_crypto (ptls_aead_context_t *ctx,
+					     int is_enc, const void *key,
+					     const void *iv)
+{
+  return ptls_vpp_crypto_aead_setup_crypto (ctx, is_enc, key, iv,
+					    VNET_CRYPTO_ALG_AES_256_GCM);
+}
+
+ptls_cipher_algorithm_t ptls_vpp_crypto_aes128ctr = { "AES128-CTR",
+						      PTLS_AES128_KEY_SIZE,
+						      1,
+						      PTLS_AES_IV_SIZE,
+						      sizeof (struct cipher_context_t),
+						      ptls_vpp_crypto_aes128ctr_setup_crypto };
+
+ptls_cipher_algorithm_t ptls_vpp_crypto_aes256ctr = { "AES256-CTR",
+						      PTLS_AES256_KEY_SIZE,
+						      1 /* block size */,
+						      PTLS_AES_IV_SIZE,
+						      sizeof (struct cipher_context_t),
+						      ptls_vpp_crypto_aes256ctr_setup_crypto };
+
+#define PTLS_X86_CACHE_LINE_ALIGN_BITS 6
+ptls_aead_algorithm_t ptls_vpp_crypto_aes128gcm = {
+  "AES128-GCM",
+  PTLS_AESGCM_CONFIDENTIALITY_LIMIT,
+  PTLS_AESGCM_INTEGRITY_LIMIT,
+  &ptls_vpp_crypto_aes128ctr,
+  NULL,
+  PTLS_AES128_KEY_SIZE,
+  PTLS_AESGCM_IV_SIZE,
+  PTLS_AESGCM_TAG_SIZE,
+  { PTLS_TLS12_AESGCM_FIXED_IV_SIZE, PTLS_TLS12_AESGCM_RECORD_IV_SIZE },
+  1,
+  PTLS_X86_CACHE_LINE_ALIGN_BITS,
+  sizeof (struct vpp_aead_context_t),
+  ptls_vpp_crypto_aead_aes128gcm_setup_crypto
+};
+
+ptls_aead_algorithm_t ptls_vpp_crypto_aes256gcm = {
+  "AES256-GCM",
+  PTLS_AESGCM_CONFIDENTIALITY_LIMIT,
+  PTLS_AESGCM_INTEGRITY_LIMIT,
+  &ptls_vpp_crypto_aes256ctr,
+  NULL,
+  PTLS_AES256_KEY_SIZE,
+  PTLS_AESGCM_IV_SIZE,
+  PTLS_AESGCM_TAG_SIZE,
+  { PTLS_TLS12_AESGCM_FIXED_IV_SIZE, PTLS_TLS12_AESGCM_RECORD_IV_SIZE },
+  1,
+  PTLS_X86_CACHE_LINE_ALIGN_BITS,
+  sizeof (struct vpp_aead_context_t),
+  ptls_vpp_crypto_aead_aes256gcm_setup_crypto
+};
+
+ptls_cipher_suite_t ptls_vpp_crypto_aes128gcmsha256 =
+  { PTLS_CIPHER_SUITE_AES_128_GCM_SHA256,
+  &ptls_vpp_crypto_aes128gcm,
+  &ptls_openssl_sha256
+};
+
+ptls_cipher_suite_t ptls_vpp_crypto_aes256gcmsha384 =
+  { PTLS_CIPHER_SUITE_AES_256_GCM_SHA384,
+  &ptls_vpp_crypto_aes256gcm,
+  &ptls_openssl_sha384
+};
+
+ptls_cipher_suite_t *ptls_vpp_crypto_cipher_suites[] = {
+  &ptls_vpp_crypto_aes256gcmsha384, &ptls_vpp_crypto_aes128gcmsha256, NULL
+};

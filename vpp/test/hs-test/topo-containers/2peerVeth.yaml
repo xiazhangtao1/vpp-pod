@@ -1,0 +1,27 @@
+---
+volumes:
+  - volume: &server-vol
+      host-dir: "$HST_VOLUME_DIR/server"
+      container-dir: "/tmp/server"
+      is-default-work-dir: true
+  - volume: &client-vol
+      host-dir: "$HST_VOLUME_DIR/client"
+      container-dir: "/tmp/client"
+      is-default-work-dir: true
+
+containers:
+  - name: "server-vpp"
+    volumes:
+      - <<: *server-vol
+  - name: "client-vpp"
+    volumes:
+      - <<: *client-vol
+  - name: "server-app"
+    is-optional: true
+    volumes:
+      - <<: *server-vol
+  - name: "client-app"
+    is-optional: true
+    volumes:
+      - <<: *client-vol
+

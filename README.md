@@ -5,9 +5,28 @@ Plugin 分配结果生成配置，避免硬编码 CPU 与 PCI 地址。
 
 ## 构建
 
+仓库已内置 VPP v26.06 源码及其第三方源码归档，默认构建不访问 GitHub：
+
 ```bash
 sudo docker build --network host -t vpp:26.06 .
 ```
+
+`vpp/build/external/downloads/` 中包含 libdaq、intel-ipsec-mb、DPDK、rdma-core、
+quicly、xdp-tools、libcbor 以及 DPDK 配置所需的 Python 包。VPP 构建系统会校验并
+直接使用这些文件，不再现场从 GitHub 下载。Ubuntu 软件包仍由 `apt` 安装，因此目标
+环境需要可用的 Ubuntu 软件源或对应的本地镜像源。
+
+如需临时改回在线获取 VPP 主仓库，可显式指定：
+
+```bash
+sudo docker build --network host \
+  --build-arg VPP_SOURCE=online \
+  --build-arg VPP_REF=v26.06 \
+  -t vpp:26.06 .
+```
+
+更新内置源码时，应同步替换 `vpp/` 并在联网环境重新准备与该版本匹配的
+`vpp/build/external/downloads/`；不同 VPP 版本的依赖版本和校验值可能不同。
 
 ## 部署
 

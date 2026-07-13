@@ -1,0 +1,708 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2025 Cisco Systems, Inc.
+ */
+
+#include <vnet/session/application_crypto.h>
+#include <vnet/session/application.h>
+#include <vnet/session/application_interface.h>
+#include <vnet/session/session.h>
+
+typedef struct app_crypto_main_
+{
+  crypto_engine_type_t last_crypto_engine;  /* Last crypto engine type used */
+  app_cert_key_pair_t *cert_key_pair_store; /* Pool of cert/key pairs */
+} app_crypto_main_t;
+
+static app_crypto_main_t app_crypto_main;
+
+static app_cert_key_pair_t *
+app_cert_key_pair_alloc ()
+{
+  app_cert_key_pair_t *ckpair;
+  app_certkey_int_ctx_t **ckip;
+  pool_get (app_crypto_main.cert_key_pair_store, ckpair);
+  clib_memset (ckpair, 0, sizeof (*ckpair));
+  ckpair->cert_key_index = ckpair - app_crypto_main.cert_key_pair_store;
+  /* Avoid need for locks when used by workers */
+  vec_validate (ckpair->cki, vlib_num_workers ());
+  vec_foreach (ckip, ckpair->cki)
+    vec_validate (*ckip, app_crypto_main.last_crypto_engine);
+  return ckpair;
+}
+
+app_cert_key_pair_t *
+app_cert_key_pair_get (u32 index)
+{
+  return pool_elt_at_index (app_crypto_main.cert_key_pair_store, index);
+}
+
+app_cert_key_pair_t *
+app_cert_key_pair_get_if_valid (u32 index)
+{
+  if (pool_is_free_index (app_crypto_main.cert_key_pair_store, index))
+    return 0;
+  return app_cert_key_pair_get (index);
+}
+
+app_cert_key_pair_t *
+app_cert_key_pair_get_default ()
+{
+  /* To maintain legacy bapi */
+  return app_cert_key_pair_get (0);
+}
+
+static app_crypto_ca_trust_t *
+app_crypto_alloc_ca_trust (application_t *app)
+{
+  app_crypto_ca_trust_t *ca_trust;
+
+  /* first element not used */
+  if (!pool_elts (app->crypto_ctx.ca_trust_stores))
+    pool_get_zero (app->crypto_ctx.ca_trust_stores, ca_trust);
+  pool_get_zero (app->crypto_ctx.ca_trust_stores, ca_trust);
+  ca_trust->ca_trust_index = ca_trust - app->crypto_ctx.ca_trust_stores;
+  /* Avoid need for locks when used by workers */
+  vec_validate (ca_trust->cti, vlib_num_workers ());
+
+  return ca_trust;
+}
+
+int
+app_crypto_add_ca_trust (u32 app_index, app_ca_trust_add_args_t *args)
+{
+  application_t *app;
+  app_crypto_ca_trust_t *ca_trust;
+
+  app = application_get (app_index);
+  ca_trust = app_crypto_alloc_ca_trust (app);
+  ca_trust->ca_chain = args->ca_chain;
+  ca_trust->crl = args->crl;
+  ca_trust->app_index = app_index;
+  args->index = ca_trust->ca_trust_index;
+
+  return 0;
+}
+
+app_crypto_ca_trust_t *
+app_crypto_get_wrk_ca_trust (u32 app_wrk_index, u32 ca_trust_index)
+{
+  app_worker_t *app_wrk;
+  application_t *app;
+
+  app_wrk = app_worker_get (app_wrk_index);
+  app = application_get (app_wrk->app_index);
+
+  return app_get_crypto_ca_trust (app, ca_trust_index);
+}
+
+app_crypto_ca_trust_int_ctx_t *
+app_crypto_alloc_int_ca_trust (app_crypto_ca_trust_t *ct,
+			       clib_thread_index_t thread_index)
+{
+  app_crypto_ca_trust_int_ctx_t *cti;
+  cti = vec_elt_at_index (ct->cti, thread_index);
+  cti->thread_index = thread_index;
+  return cti;
+}
+
+app_crypto_ca_trust_int_ctx_t *
+app_crypto_get_int_ca_trust (app_crypto_ca_trust_t *ct,
+			     clib_thread_index_t thread_index)
+{
+  if (vec_len (ct->cti) <= thread_index)
+    return 0;
+  return vec_elt_at_index (ct->cti, thread_index);
+}
+
+int
+app_crypto_update_ca_trust_crl (u32 app_index, app_ca_trust_update_crl_args_t *args)
+{
+  app_crypto_ca_trust_int_ctx_t *cti;
+  app_crypto_ca_trust_t *ct;
+  application_t *app;
+
+  app = application_get_if_valid (app_index);
+  if (!app)
+    return SESSION_E_INVALID;
+
+  ct = app_get_crypto_ca_trust (app, args->ca_trust_index);
+  if (!ct)
+    return SESSION_E_INVALID;
+
+  vec_free (ct->crl);
+  ct->crl = args->crl;
+
+  /* Invalidate all per-thread internal contexts so they are rebuilt
+   * with the updated CRL on next use */
+  vec_foreach (cti, ct->cti)
+    {
+      if (cti->update_cb)
+	(cti->update_cb) (cti, ct, APP_CA_TRUST_UPDATE_TYPE_CRL);
+    }
+
+  return 0;
+}
+
+int
+vnet_app_add_cert_key_pair (vnet_app_add_cert_key_pair_args_t *a)
+{
+  app_cert_key_pair_t *ckpair = app_cert_key_pair_alloc ();
+  vec_validate (ckpair->cert, a->cert_len - 1);
+  clib_memcpy_fast (ckpair->cert, a->cert, a->cert_len);
+  vec_validate (ckpair->key, a->key_len - 1);
+  clib_memcpy_fast (ckpair->key, a->key, a->key_len);
+  a->index = ckpair->cert_key_index;
+  return 0;
+}
+
+static void
+app_certkey_free_int_ctx (app_cert_key_pair_t *ck)
+{
+  app_certkey_int_ctx_t **ckip;
+  app_certkey_int_ctx_t *cki;
+
+  vec_foreach (ckip, ck->cki)
+    {
+      vec_foreach (cki, *ckip)
+	{
+	  if (cki->cleanup_cb)
+	    (cki->cleanup_cb) (cki);
+	  cki->cert = 0;
+	  cki->key = 0;
+	}
+      vec_free (*ckip);
+    }
+  vec_free (ck->cki);
+}
+
+int
+vnet_app_del_cert_key_pair (u32 index)
+{
+  app_cert_key_pair_t *ckpair;
+
+  if (!(ckpair = app_cert_key_pair_get_if_valid (index)))
+    return SESSION_E_INVALID;
+
+  app_certkey_free_int_ctx (ckpair);
+
+  vec_free (ckpair->cert);
+  vec_free (ckpair->key);
+  pool_put (app_crypto_main.cert_key_pair_store, ckpair);
+  return 0;
+}
+
+app_crypto_async_req_ticket_t
+app_crypto_async_req (app_crypto_async_req_t *areq)
+{
+  app_crypto_async_req_t *req;
+  app_crypto_wrk_t *crypto_wrk;
+  app_worker_t *app_wrk;
+  application_t *app;
+  app_crypto_async_req_ticket_t ticket;
+
+  app_wrk = app_worker_get (areq->app_wrk_index);
+  app = application_get (app_wrk->app_index);
+  if (!app->cb_fns.app_crypto_async)
+    return APP_CRYPTO_ASYNC_INVALID_TICKET;
+
+  crypto_wrk = app_crypto_wrk_get (app, areq->handle.thread_index);
+
+  /* TODO(fcoras) caching layer */
+
+  pool_get (crypto_wrk->reqs, req);
+  *req = *areq;
+  req->req_index = req - crypto_wrk->reqs;
+  req->cancelled = 0;
+  ticket.app_index = app->app_index;
+  ticket.req_index = req->req_index;
+
+  /* Hand over request to app */
+  if (app->cb_fns.app_crypto_async (req))
+    return APP_CRYPTO_ASYNC_INVALID_TICKET;
+
+  return ticket;
+}
+
+void
+app_crypto_async_cancel_req (app_crypto_async_req_ticket_t ticket)
+{
+  application_t *app = application_get (ticket.app_index);
+  clib_thread_index_t thread_index = vlib_get_thread_index ();
+  app_crypto_async_req_t *req;
+  app_crypto_wrk_t *crypto_wrk;
+
+  crypto_wrk = app_crypto_wrk_get (app, thread_index);
+
+  if (pool_is_free_index (crypto_wrk->reqs, ticket.req_index))
+    return;
+  req = pool_elt_at_index (crypto_wrk->reqs, ticket.req_index);
+  req->cancelled = 1;
+}
+
+void
+app_crypto_async_reply (app_crypto_async_reply_t *reply)
+{
+  application_t *app = application_get (reply->app_index);
+  clib_thread_index_t thread_index = reply->handle.thread_index;
+  app_crypto_wrk_t *crypto_wrk;
+  app_crypto_async_req_t *req;
+
+  ASSERT (thread_index == vlib_get_thread_index ());
+
+  crypto_wrk = app_crypto_wrk_get (app, thread_index);
+  req = pool_elt_at_index (crypto_wrk->reqs, reply->req_index);
+
+  if (req->cancelled)
+    goto done;
+
+  reply->handle = req->handle;
+  req->cb (reply);
+
+done:
+  pool_put (crypto_wrk->reqs, req);
+}
+
+void
+app_crypto_ctx_init (app_crypto_ctx_t *crypto_ctx)
+{
+  vec_validate (crypto_ctx->wrk, vlib_num_workers ());
+}
+
+static void
+app_crypto_ca_stores_cleanup (app_crypto_ca_trust_t *ca_stores)
+{
+  app_crypto_ca_trust_int_ctx_t *cti;
+  app_crypto_ca_trust_t *ct;
+
+  pool_foreach (ct, ca_stores)
+    {
+      vec_foreach (cti, ct->cti)
+	{
+	  if (cti->update_cb)
+	    (cti->update_cb) (cti, ct, APP_CA_TRUST_UPDATE_TYPE_DEL);
+	  cti->ca_store = 0;
+	}
+      vec_free (ct->cti);
+      vec_free (ct->ca_chain);
+      vec_free (ct->crl);
+    }
+}
+
+static void
+app_crypto_tls_profiles_cleanup (app_tls_profile_t *tls_profiles)
+{
+  app_tls_profile_t *profile;
+
+  if (!tls_profiles)
+    return;
+
+  pool_foreach (profile, tls_profiles)
+    {
+      vec_free (profile->cipher_list);
+      vec_free (profile->ciphersuites);
+      vec_free (profile->groups);
+    }
+}
+
+void
+app_crypto_ctx_free (app_crypto_ctx_t *crypto_ctx)
+{
+  app_crypto_wrk_t *crypto_wrk;
+
+  if (crypto_ctx->ca_trust_stores)
+    {
+      app_crypto_ca_stores_cleanup (crypto_ctx->ca_trust_stores);
+      pool_free (crypto_ctx->ca_trust_stores);
+    }
+
+  if (crypto_ctx->tls_profiles)
+    {
+      app_crypto_tls_profiles_cleanup (crypto_ctx->tls_profiles);
+      pool_free (crypto_ctx->tls_profiles);
+    }
+
+  vec_foreach (crypto_wrk, crypto_ctx->wrk)
+    pool_free (crypto_wrk->reqs);
+  vec_free (crypto_ctx->wrk);
+}
+
+/*
+ * TLS profile management
+ */
+
+int
+app_crypto_add_tls_profile (u32 app_index, app_tls_profile_add_args_t *args)
+{
+  application_t *app;
+  app_tls_profile_t *profile;
+
+  app = application_get (app_index);
+  if (!app)
+    return -1;
+
+  pool_get_zero (app->crypto_ctx.tls_profiles, profile);
+  profile->profile_index = profile - app->crypto_ctx.tls_profiles;
+
+  profile->cipher_list = vec_dup (args->cipher_list);
+  profile->ciphersuites = vec_dup (args->ciphersuites);
+  profile->groups = vec_dup (args->groups);
+  profile->min_version = args->min_version;
+  profile->max_version = args->max_version;
+
+  args->index = profile->profile_index;
+  return 0;
+}
+
+void
+app_crypto_del_tls_profile (u32 app_index, u32 profile_index)
+{
+  application_t *app;
+  app_tls_profile_t *profile;
+
+  app = application_get (app_index);
+  if (!app || pool_is_free_index (app->crypto_ctx.tls_profiles, profile_index))
+    return;
+
+  profile = pool_elt_at_index (app->crypto_ctx.tls_profiles, profile_index);
+
+  vec_free (profile->cipher_list);
+  vec_free (profile->ciphersuites);
+  vec_free (profile->groups);
+  pool_put (app->crypto_ctx.tls_profiles, profile);
+}
+
+app_tls_profile_t *
+app_crypto_get_tls_profile (u32 app_wrk_index, u32 profile_index)
+{
+  app_worker_t *app_wrk;
+  application_t *app;
+
+  app_wrk = app_worker_get (app_wrk_index);
+  app = application_get (app_wrk->app_index);
+
+  return pool_elt_at_index (app->crypto_ctx.tls_profiles, profile_index);
+}
+
+app_tls_profile_t *
+app_crypto_get_tls_profile_if_valid (u32 app_wrk_index, u32 profile_index)
+{
+  app_worker_t *app_wrk;
+  application_t *app;
+
+  if (profile_index == ~0)
+    return 0;
+
+  app_wrk = app_worker_get (app_wrk_index);
+  app = application_get (app_wrk->app_index);
+
+  if (pool_is_free_index (app->crypto_ctx.tls_profiles, profile_index))
+    return 0;
+
+  return pool_elt_at_index (app->crypto_ctx.tls_profiles, profile_index);
+}
+
+u8 *
+format_cert_key_pair (u8 *s, va_list *args)
+{
+  app_cert_key_pair_t *ckpair = va_arg (*args, app_cert_key_pair_t *);
+  int key_len = 0, cert_len = 0;
+  cert_len = vec_len (ckpair->cert);
+  key_len = vec_len (ckpair->key);
+  if (ckpair->cert_key_index == 0)
+    s = format (s, "DEFAULT (cert:%d, key:%d)", cert_len, key_len);
+  else
+    s = format (s, "%d (cert:%d, key:%d)", ckpair->cert_key_index, cert_len,
+		key_len);
+  return s;
+}
+
+static clib_error_t *
+show_certificate_command_fn (vlib_main_t *vm, unformat_input_t *input,
+			     vlib_cli_command_t *cmd)
+{
+  app_cert_key_pair_t *ckpair;
+  session_cli_return_if_not_enabled ();
+
+  pool_foreach (ckpair, app_crypto_main.cert_key_pair_store)
+    {
+      vlib_cli_output (vm, "%U", format_cert_key_pair, ckpair);
+    }
+  return 0;
+}
+
+VLIB_CLI_COMMAND (show_certificate_command, static) = {
+  .path = "show app certificate",
+  .short_help = "list app certs and keys present in store",
+  .function = show_certificate_command_fn,
+};
+
+static uword
+unformat_app_tls_version (unformat_input_t *input, va_list *args)
+{
+  u16 *version = va_arg (*args, u16 *);
+
+  if (unformat (input, "ssl3"))
+    *version = APP_TLS_VERSION_SSL3;
+  else if (unformat (input, "1.0"))
+    *version = APP_TLS_VERSION_1_0;
+  else if (unformat (input, "1.1"))
+    *version = APP_TLS_VERSION_1_1;
+  else if (unformat (input, "1.2"))
+    *version = APP_TLS_VERSION_1_2;
+  else if (unformat (input, "1.3"))
+    *version = APP_TLS_VERSION_1_3;
+  else
+    return 0;
+
+  return 1;
+}
+
+u8 *
+format_app_tls_version (u8 *s, va_list *args)
+{
+  u16 version = va_arg (*args, u32);
+
+  switch (version)
+    {
+    case APP_TLS_VERSION_SSL3:
+      s = format (s, "ssl3");
+      break;
+    case APP_TLS_VERSION_1_0:
+      s = format (s, "1.0");
+      break;
+    case APP_TLS_VERSION_1_1:
+      s = format (s, "1.1");
+      break;
+    case APP_TLS_VERSION_1_2:
+      s = format (s, "1.2");
+      break;
+    case APP_TLS_VERSION_1_3:
+      s = format (s, "1.3");
+      break;
+    default:
+      s = format (s, "0x%x", version);
+      break;
+    }
+
+  return s;
+}
+
+static clib_error_t *
+app_crypto_add_tls_profile_command_fn (vlib_main_t *vm, unformat_input_t *input,
+				       vlib_cli_command_t *cmd)
+{
+  app_tls_profile_add_args_t args = { 0 };
+  u8 *cipher_list = 0, *ciphersuites = 0, *groups = 0;
+  u32 app_index = 0;
+  application_t *app;
+
+  session_cli_return_if_not_enabled ();
+
+  while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (input, "app %U", unformat_app_index, &app_index))
+	;
+      else if (unformat (input, "cipher-list %s", &cipher_list))
+	;
+      else if (unformat (input, "ciphersuites %s", &ciphersuites))
+	;
+      else if (unformat (input, "groups %s", &groups))
+	;
+      else if (unformat (input, "min-version %U", unformat_app_tls_version, &args.min_version))
+	;
+      else if (unformat (input, "max-version %U", unformat_app_tls_version, &args.max_version))
+	;
+      else
+	return clib_error_return (0, "unknown input '%U'", format_unformat_error, input);
+    }
+
+  app = application_get_if_valid (app_index);
+  if (!app)
+    {
+      vec_free (cipher_list);
+      vec_free (ciphersuites);
+      vec_free (groups);
+      return clib_error_return (0, "invalid application index %u", app_index);
+    }
+
+  args.cipher_list = cipher_list;
+  args.ciphersuites = ciphersuites;
+  args.groups = groups;
+
+  if (app_crypto_add_tls_profile (app_index, &args))
+    {
+      vec_free (cipher_list);
+      vec_free (ciphersuites);
+      vec_free (groups);
+      return clib_error_return (0, "failed to add TLS profile");
+    }
+
+  vlib_cli_output (vm, "Added TLS profile %u to app %u", args.index, app_index);
+  return 0;
+}
+
+VLIB_CLI_COMMAND (app_crypto_add_tls_profile_cmd, static) = {
+  .path = "app crypto add tls-profile",
+  .short_help = "app crypto add tls-profile app <app-name|app-index> "
+		"[cipher-list <list>] [ciphersuites <suites>] "
+		"[groups <groups>] [min-version <1.0|1.1|1.2|1.3>] "
+		"[max-version <1.0|1.1|1.2|1.3>]",
+  .function = app_crypto_add_tls_profile_command_fn,
+};
+
+static clib_error_t *
+app_crypto_del_tls_profile_command_fn (vlib_main_t *vm, unformat_input_t *input,
+				       vlib_cli_command_t *cmd)
+{
+  u32 profile_index, app_index = 0;
+  application_t *app;
+
+  session_cli_return_if_not_enabled ();
+
+  while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (input, "app %U", unformat_app_index, &app_index))
+	;
+      else if (unformat (input, "%u", &profile_index))
+	;
+      else
+	return clib_error_return (0, "unknown input '%U'", format_unformat_error, input);
+    }
+
+  app = application_get_if_valid (app_index);
+  if (!app)
+    return clib_error_return (0, "invalid application index %u", app_index);
+
+  app_crypto_del_tls_profile (app_index, profile_index);
+  vlib_cli_output (vm, "Deleted TLS profile %u from app %u", profile_index, app_index);
+  return 0;
+}
+
+VLIB_CLI_COMMAND (app_crypto_del_tls_profile_cmd, static) = {
+  .path = "app crypto del tls-profile",
+  .short_help = "app crypto del tls-profile app <app-name|app-index> <profile-index>",
+  .function = app_crypto_del_tls_profile_command_fn,
+};
+
+static u8 *
+format_tls_profile (u8 *s, va_list *args)
+{
+  app_tls_profile_t *prof = va_arg (*args, app_tls_profile_t *);
+
+  s = format (s, "[%u] ", prof->profile_index);
+
+  if (prof->cipher_list)
+    s = format (s, "cipher-list: %s ", prof->cipher_list);
+  if (prof->ciphersuites)
+    s = format (s, "ciphersuites: %s ", prof->ciphersuites);
+  if (prof->groups)
+    s = format (s, "groups: %s ", prof->groups);
+  if (prof->min_version || prof->max_version)
+    s = format (s, "versions: %U-%U ", format_app_tls_version, prof->min_version,
+		format_app_tls_version, prof->max_version);
+
+  return s;
+}
+
+static clib_error_t *
+show_tls_profile_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
+{
+  u32 app_index = 0;
+  application_t *app;
+  app_tls_profile_t *profile;
+
+  session_cli_return_if_not_enabled ();
+
+  if (unformat (input, "app %U", unformat_app_index, &app_index))
+    ;
+
+  app = application_get_if_valid (app_index);
+  if (!app)
+    {
+      vlib_cli_output (vm, "Invalid application index %u", app_index);
+      return 0;
+    }
+
+  if (!app->crypto_ctx.tls_profiles)
+    {
+      vlib_cli_output (vm, "No TLS profiles for app %u", app_index);
+      return 0;
+    }
+
+  vlib_cli_output (vm, "TLS Profiles for app %u:", app_index);
+  pool_foreach (profile, app->crypto_ctx.tls_profiles)
+    {
+      vlib_cli_output (vm, "  %U", format_tls_profile, profile);
+    }
+
+  return 0;
+}
+
+VLIB_CLI_COMMAND (show_tls_profile_command, static) = {
+  .path = "show app tls-profile",
+  .short_help = "show app tls-profile [app <app-name|app-index>]",
+  .function = show_tls_profile_command_fn,
+};
+
+crypto_engine_type_t
+app_crypto_engine_type_add (void)
+{
+  return (++app_crypto_main.last_crypto_engine);
+}
+
+u8 *
+format_crypto_engine (u8 *s, va_list *args)
+{
+  u32 engine = va_arg (*args, u32);
+  switch (engine)
+    {
+    case CRYPTO_ENGINE_NONE:
+      return format (s, "none");
+    case CRYPTO_ENGINE_MBEDTLS:
+      return format (s, "mbedtls");
+    case CRYPTO_ENGINE_OPENSSL:
+      return format (s, "openssl");
+    case CRYPTO_ENGINE_PICOTLS:
+      return format (s, "picotls");
+    case CRYPTO_ENGINE_VPP:
+      return format (s, "vpp");
+    default:
+      return format (s, "unknown engine");
+    }
+  return s;
+}
+
+uword
+unformat_crypto_engine (unformat_input_t *input, va_list *args)
+{
+  u8 *a = va_arg (*args, u8 *);
+  if (unformat (input, "mbedtls"))
+    *a = CRYPTO_ENGINE_MBEDTLS;
+  else if (unformat (input, "openssl"))
+    *a = CRYPTO_ENGINE_OPENSSL;
+  else if (unformat (input, "picotls"))
+    *a = CRYPTO_ENGINE_PICOTLS;
+  else if (unformat (input, "vpp"))
+    *a = CRYPTO_ENGINE_VPP;
+  else
+    return 0;
+  return 1;
+}
+
+u8
+app_crypto_engine_n_types (void)
+{
+  return (app_crypto_main.last_crypto_engine + 1);
+}
+
+clib_error_t *
+application_crypto_init ()
+{
+  app_crypto_main_t *acm = &app_crypto_main;
+
+  /* Index 0 is invalid, used to indicate that no cert was provided */
+  app_cert_key_pair_alloc ();
+
+  acm->last_crypto_engine = CRYPTO_ENGINE_LAST;
+  return 0;
+}
