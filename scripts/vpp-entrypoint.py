@@ -63,7 +63,7 @@ def parse_cpu_limit(value):
     return int(value)
 
 
-def wait_for_cpus(limit, interval=2.0):
+def wait_for_cpus(limit, interval=0.1):
     last = None
     while True:
         cpus, source = read_allowed_cpus()

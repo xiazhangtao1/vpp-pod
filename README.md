@@ -28,7 +28,8 @@ kubectl exec vpp -- vppctl -s /run/vpp/cli.sock show ip fib
 
 入口程序只在可见 CPU 数量等于 `VPP_CPU_LIMIT` 后启动。一个 CPU 只生成
 `main-core`；两个或更多 CPU 使用排序后的第一个作为 main，其余全部作为 worker。
-等待没有超时，以适应当前环境 CPU Manager 延迟分配的行为。
+入口程序立即检查 cpuset，数量不匹配时每 100 毫秒重试且没有超时，以适应当前环境
+CPU Manager 延迟分配的行为。
 
 可通过 ConfigMap 覆盖三个模板，但动态模板必须分别保留以下占位符且只能出现一次：
 
