@@ -18,7 +18,7 @@ class EntrypointTests(unittest.TestCase):
         self.assertEqual(ENTRYPOINT.cpu_config([44]), "    main-core 44")
         self.assertEqual(
             ENTRYPOINT.cpu_config([44, 116, 117]),
-            "    main-core 44\n    corelist-workers 116",
+            "    main-core 44\n    corelist-workers 116,117",
         )
 
     def test_pci_requires_exactly_one_device(self):

@@ -84,7 +84,7 @@ def wait_for_cpus(limit, interval=2.0):
 def cpu_config(cpus):
     lines = [f"    main-core {cpus[0]}"]
     if len(cpus) >= 2:
-        lines.append(f"    corelist-workers {cpus[1]}")
+        lines.append(f"    corelist-workers {','.join(str(cpu) for cpu in cpus[1:])}")
     return "\n".join(lines)
 
 
