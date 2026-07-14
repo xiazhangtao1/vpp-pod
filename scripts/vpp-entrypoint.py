@@ -128,8 +128,10 @@ def parse_addresses(value, maximum=1024):
 
 
 def validate_gateway(value, addresses):
+    if value is None or not value.strip():
+        return None
     try:
-        gateway = ipaddress.IPv4Address(value)
+        gateway = ipaddress.IPv4Address(value.strip())
         network = ipaddress.IPv4Interface(addresses[0]).network
     except ValueError as exc:
         raise ConfigError(f"invalid default gateway: {value}") from exc
@@ -172,14 +174,16 @@ def generate(template_dir, output_dir, cpus, pci, addresses, gateway):
         "INTERFACE_ADDRESS_COMMANDS": "\n".join(
             f"set interface ip address dpdk0 {address}" for address in addresses
         ),
-        "DEFAULT_GATEWAY": gateway,
+        "DEFAULT_ROUTE_COMMAND": (
+            f"ip route add 0.0.0.0/0 via {gateway}" if gateway is not None else ""
+        ),
     }
     templates = {
         "startup.conf.template": ("startup.conf", ("CPU_CONFIG", "PCI_ADDRESS")),
         "vcl.conf.template": ("vcl.conf", ()),
         "cli-commands.conf.template": (
             "cli-commands.conf",
-            ("INTERFACE_ADDRESS_COMMANDS", "DEFAULT_GATEWAY"),
+            ("INTERFACE_ADDRESS_COMMANDS", "DEFAULT_ROUTE_COMMAND"),
         ),
     }
     for source_name, (destination_name, tokens) in templates.items():
@@ -199,7 +203,7 @@ def main():
         pci = parse_pci(os.environ.get("PCIDEVICE_INTEL_COM_EXTERNAL_NETWORK"))
         maximum = int(os.environ.get("VPP_MAX_INTERFACE_ADDRESSES", "1024"))
         addresses = parse_addresses(os.environ.get("VPP_INTERFACE_ADDRESSES"), maximum)
-        gateway = validate_gateway(os.environ.get("VPP_DEFAULT_GATEWAY", "10.2.7.254"), addresses)
+        gateway = validate_gateway(os.environ.get("VPP_DEFAULT_GATEWAY"), addresses)
         template_dir = Path(os.environ.get("VPP_TEMPLATE_DIR", "/usr/share/vpp/templates"))
         output_dir = Path(os.environ.get("VPP_CONFIG_DIR", "/run/vpp/config"))
         generate(template_dir, output_dir, cpus, pci, addresses, gateway)

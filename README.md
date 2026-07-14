@@ -45,6 +45,9 @@ kubectl exec vpp -- vppctl -s /run/vpp/cli.sock show ip fib
 `VPP_INTERFACE_ADDRESSES` 支持单地址 `10.2.0.222/20`，也支持范围
 `10.2.0.222-10.2.0.225/20`。范围内所有地址都会配置到 `dpdk0`。
 
+`VPP_DEFAULT_GATEWAY` 可配置为接口子网内的 IPv4 网关；为空或不提供时，
+入口程序不会生成 IPv4 默认路由。示例 YAML 中默认使用 `10.2.7.254`。
+
 入口程序只在可见 CPU 数量等于 `VPP_CPU_LIMIT` 后启动。一个 CPU 只生成
 `main-core`；两个或更多 CPU 使用排序后的第一个作为 main，其余全部作为 worker。
 入口程序立即检查 cpuset，数量不匹配时每 100 毫秒重试且没有超时，以适应当前环境
@@ -53,7 +56,7 @@ CPU Manager 延迟分配的行为。
 可通过 ConfigMap 覆盖三个模板，但动态模板必须分别保留以下占位符且只能出现一次：
 
 - `startup.conf.template`: `{{CPU_CONFIG}}`、`{{PCI_ADDRESS}}`
-- `cli-commands.conf.template`: `{{INTERFACE_ADDRESS_COMMANDS}}`、`{{DEFAULT_GATEWAY}}`
+- `cli-commands.conf.template`: `{{INTERFACE_ADDRESS_COMMANDS}}`、`{{DEFAULT_ROUTE_COMMAND}}`
 - `vcl.conf.template`: 无动态占位符
 
 ## 本地测试

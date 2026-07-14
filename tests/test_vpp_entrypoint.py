@@ -52,6 +52,11 @@ class EntrypointTests(unittest.TestCase):
         with self.assertRaises(ENTRYPOINT.ConfigError):
             ENTRYPOINT.validate_gateway("10.3.0.1", ["10.2.0.222/20"])
 
+    def test_gateway_may_be_empty_or_omitted(self):
+        self.assertIsNone(ENTRYPOINT.validate_gateway(None, ["10.2.0.222/20"]))
+        self.assertIsNone(ENTRYPOINT.validate_gateway("", ["10.2.0.222/20"]))
+        self.assertIsNone(ENTRYPOINT.validate_gateway("  ", ["10.2.0.222/20"]))
+
     def test_generate_single_cpu_and_address_range(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
@@ -69,7 +74,23 @@ class EntrypointTests(unittest.TestCase):
             self.assertNotIn("corelist-workers", startup)
             self.assertIn("dev 0000:a9:0b.0", startup)
             self.assertEqual(cli.count("set interface ip address dpdk0"), 2)
+            self.assertIn("ip route add 0.0.0.0/0 via 10.2.7.254", cli)
             self.assertNotIn("{{", startup + cli)
+
+    def test_generate_without_default_gateway(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            ENTRYPOINT.generate(
+                ROOT / "config",
+                output,
+                [44],
+                "0000:a9:0b.0",
+                ["10.2.0.222/20"],
+                None,
+            )
+            cli = (output / "cli-commands.conf").read_text()
+            self.assertNotIn("ip route add 0.0.0.0/0", cli)
+            self.assertNotIn("{{", cli)
 
 
 if __name__ == "__main__":

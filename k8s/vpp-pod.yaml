@@ -66,7 +66,7 @@ data:
   cli-commands.conf.template: |
     set interface state dpdk0 up
     {{INTERFACE_ADDRESS_COMMANDS}}
-    ip route add 0.0.0.0/0 via {{DEFAULT_GATEWAY}}
+    {{DEFAULT_ROUTE_COMMAND}}
 ---
 apiVersion: v1
 kind: Pod
@@ -93,6 +93,7 @@ spec:
             configMapKeyRef:
               name: vpp-config
               key: VPP_DEFAULT_GATEWAY
+              optional: true
         - name: VPP_CPU_LIMIT
           valueFrom:
             resourceFieldRef:
