@@ -3,7 +3,8 @@ kind: ConfigMap
 metadata:
   name: vpp-config
 data:
-  VPP_INTERFACE_ADDRESSES: 10.2.0.222-10.2.0.223/20
+  USP_INTER_IP: 10.2.0.222-10.2.0.223
+  USP_INTER_MASK: "20"
   VPP_DEFAULT_GATEWAY: 10.2.7.254
   startup.conf.template: |
     unix {
@@ -83,11 +84,16 @@ spec:
       securityContext:
         privileged: true
       env:
-        - name: VPP_INTERFACE_ADDRESSES
+        - name: USP_INTER_IP
           valueFrom:
             configMapKeyRef:
               name: vpp-config
-              key: VPP_INTERFACE_ADDRESSES
+              key: USP_INTER_IP
+        - name: USP_INTER_MASK
+          valueFrom:
+            configMapKeyRef:
+              name: vpp-config
+              key: USP_INTER_MASK
         - name: VPP_DEFAULT_GATEWAY
           valueFrom:
             configMapKeyRef:

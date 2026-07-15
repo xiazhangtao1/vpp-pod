@@ -42,8 +42,9 @@ kubectl exec vpp -- vppctl -s /run/vpp/cli.sock show interface address
 kubectl exec vpp -- vppctl -s /run/vpp/cli.sock show ip fib
 ```
 
-`VPP_INTERFACE_ADDRESSES` 支持单地址 `10.2.0.222/20`，也支持范围
-`10.2.0.222-10.2.0.225/20`。范围内所有地址都会配置到 `dpdk0`。
+`USP_INTER_IP` 支持单地址 `10.2.0.222`，也支持范围
+`10.2.0.222-10.2.0.225`；前缀长度通过 `USP_INTER_MASK` 单独配置，例如 `20`。
+范围内所有地址都会使用该前缀长度配置到 `dpdk0`。
 
 `VPP_DEFAULT_GATEWAY` 可配置为接口子网内的 IPv4 网关；为空或不提供时，
 入口程序不会生成 IPv4 默认路由。示例 YAML 中默认使用 `10.2.7.254`。

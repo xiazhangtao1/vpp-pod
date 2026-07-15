@@ -99,12 +99,19 @@ def parse_pci(value):
     return devices[0].lower()
 
 
-def parse_addresses(value, maximum=1024):
+def parse_addresses(value, prefix_value, maximum=1024):
     if not value:
-        raise ConfigError("VPP_INTERFACE_ADDRESSES is required")
+        raise ConfigError("USP_INTER_IP is required")
     try:
-        address_part, prefix_text = value.strip().rsplit("/", 1)
-        prefix = int(prefix_text)
+        prefix = int(prefix_value)
+        if not 0 <= prefix <= 32:
+            raise ValueError
+    except (ValueError, TypeError):
+        raise ConfigError("USP_INTER_MASK must be an integer from 0 to 32") from None
+    try:
+        address_part = value.strip()
+        if "/" in address_part:
+            raise ConfigError("USP_INTER_IP must not include a prefix; use USP_INTER_MASK")
         if "-" in address_part:
             first_text, last_text = address_part.split("-", 1)
         else:
@@ -119,7 +126,7 @@ def parse_addresses(value, maximum=1024):
     except ConfigError:
         raise
     except (ValueError, TypeError) as exc:
-        raise ConfigError(f"invalid interface address specification: {value}") from exc
+        raise ConfigError(f"invalid USP_INTER_IP specification: {value}") from exc
 
     count = int(last) - int(first) + 1
     if count > maximum:
@@ -202,7 +209,9 @@ def main():
         cpus = wait_for_cpus(limit)
         pci = parse_pci(os.environ.get("PCIDEVICE_INTEL_COM_EXTERNAL_NETWORK"))
         maximum = int(os.environ.get("VPP_MAX_INTERFACE_ADDRESSES", "1024"))
-        addresses = parse_addresses(os.environ.get("VPP_INTERFACE_ADDRESSES"), maximum)
+        addresses = parse_addresses(
+            os.environ.get("USP_INTER_IP"), os.environ.get("USP_INTER_MASK"), maximum
+        )
         gateway = validate_gateway(os.environ.get("VPP_DEFAULT_GATEWAY"), addresses)
         template_dir = Path(os.environ.get("VPP_TEMPLATE_DIR", "/usr/share/vpp/templates"))
         output_dir = Path(os.environ.get("VPP_CONFIG_DIR", "/run/vpp/config"))

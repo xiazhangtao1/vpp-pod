@@ -27,9 +27,9 @@ class EntrypointTests(unittest.TestCase):
             ENTRYPOINT.parse_pci("0000:a9:0b.0,0000:a9:0c.0")
 
     def test_single_and_range_addresses(self):
-        self.assertEqual(ENTRYPOINT.parse_addresses("10.2.0.222/20"), ["10.2.0.222/20"])
+        self.assertEqual(ENTRYPOINT.parse_addresses("10.2.0.222", "20"), ["10.2.0.222/20"])
         self.assertEqual(
-            ENTRYPOINT.parse_addresses("10.2.0.222-10.2.0.225/20"),
+            ENTRYPOINT.parse_addresses("10.2.0.222-10.2.0.225", "20"),
             [
                 "10.2.0.222/20",
                 "10.2.0.223/20",
@@ -39,11 +39,18 @@ class EntrypointTests(unittest.TestCase):
         )
 
     def test_invalid_address_ranges(self):
-        for value in ("10.2.0.225-10.2.0.222/20", "10.2.15.254-10.2.16.1/20"):
+        for value in ("10.2.0.225-10.2.0.222", "10.2.15.254-10.2.16.1"):
             with self.subTest(value=value), self.assertRaises(ENTRYPOINT.ConfigError):
-                ENTRYPOINT.parse_addresses(value)
+                ENTRYPOINT.parse_addresses(value, "20")
         with self.assertRaises(ENTRYPOINT.ConfigError):
-            ENTRYPOINT.parse_addresses("10.2.0.1-10.2.0.4/20", maximum=2)
+            ENTRYPOINT.parse_addresses("10.2.0.1-10.2.0.4", "20", maximum=2)
+
+    def test_invalid_address_mask(self):
+        for mask in (None, "", "-1", "33", "abc"):
+            with self.subTest(mask=mask), self.assertRaises(ENTRYPOINT.ConfigError):
+                ENTRYPOINT.parse_addresses("10.2.0.222", mask)
+        with self.assertRaises(ENTRYPOINT.ConfigError):
+            ENTRYPOINT.parse_addresses("10.2.0.222/20", "20")
 
     def test_gateway_must_be_in_subnet(self):
         self.assertEqual(
